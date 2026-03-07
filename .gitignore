@@ -12,6 +12,17 @@ wheels/
 # Secrets
 .env
 
+# Node
+node_modules/
+
 # Type checking / linting caches
 .mypy_cache/
 .ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
