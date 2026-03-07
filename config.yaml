@@ -1,0 +1,33 @@
+# AI Orchestrator Configuration
+# Models and roles for the MCP orchestrator.
+# API keys are read from environment variables (see .env).
+
+providers:
+  anthropic:
+    api_key_env: ANTHROPIC_API_KEY
+    default_model: claude-sonnet-4-20250514
+  google:
+    api_key_env: GOOGLE_AI_API_KEY
+    default_model: gemini-2.0-flash
+
+roles:
+  # Deep domain research — large context, exploratory
+  research:
+    provider: google
+    model: gemini-2.0-pro
+    description: Deep domain research, large context analysis
+    max_tokens: 8192
+
+  # Architecture and design — multi-file coordination, task specs
+  architect:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    description: Design decisions, task specs, multi-file coordination
+    max_tokens: 4096
+
+  # Fast classification — cheap model to route tasks
+  classify:
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+    description: Fast classification, lightweight routing decisions
+    max_tokens: 256

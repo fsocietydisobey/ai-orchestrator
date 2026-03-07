@@ -1,0 +1,15 @@
+{
+  "name": "ai-orchestrator",
+  "version": "1.0.0",
+  "description": "MCP server that routes tasks to the right AI model based on what kind of thinking is needed.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@openai/codex": "^0.107.0"
+  }
+}
