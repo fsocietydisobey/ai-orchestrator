@@ -4,7 +4,7 @@ How to use the ai-orchestrator MCP tools from Cursor (or Claude Code).
 
 ## Overview
 
-The MCP server gives your IDE access to 12 tools backed by two AI models:
+The MCP server gives your IDE access to 13 tools backed by two AI models:
 
 - **Gemini** (gemini-3.1-pro-preview) — research and analysis. Strong at exploring topics, explaining concepts, and comparing options. Weak at writing code.
 - **Claude Code** (claude-opus-4-6) — architecture, implementation, and code quality. Runs with full codebase access via `claude -p`.
@@ -271,6 +271,68 @@ document the cli_server module
 
 ---
 
+### Orchestration
+
+---
+
+#### `orchestrate(goal, context?)`
+
+Multi-model deliberation pipeline. Gemini and Claude converse back-and-forth to assess a complex task, research the problem domain, design the architecture, and produce a complete TASK.md plan.
+
+**IMPORTANT**: This tool produces a plan for review only. It does NOT implement anything. You must review TASK.md and explicitly approve before implementation begins.
+
+**When to use**: For complex, ambiguous, or high-stakes tasks that benefit from both deep research AND codebase-aware architecture before implementation. When you want both models to collaborate rather than working in isolation.
+
+**What happens**:
+1. Sessions are reset for a clean slate
+2. Gemini researches the problem domain — patterns, best practices, risks, open questions (10 min per-step timeout)
+3. Claude reads the codebase and designs architecture based on Gemini's findings
+4. If Claude has open questions, Gemini researches answers → Claude refines (up to 3 rounds)
+5. Claude synthesizes everything into a TASK.md with: Assessment, Research, Architecture, Open Questions (Resolved), Implementation Plan
+6. Progress is reported via MCP notifications and a `.orchestrate-status` file
+
+**Timeouts**: Each step gets 10 minutes (2x the normal CLI timeout). The entire pipeline has a 10-minute total timeout (`ORCHESTRATE_TIMEOUT` env var). On timeout, partial results from completed steps are returned.
+
+**Progress monitoring**: While orchestration is running, check status from any terminal:
+
+```bash
+cat .orchestrate-status
+```
+
+**Examples**:
+
+```
+orchestrate adding a WebSocket notification system for real-time updates
+
+orchestrate refactoring the auth system to support OAuth2 + SAML
+  context: we currently use JWT tokens, need to keep backward compatibility
+
+orchestrate migrating from REST to GraphQL for the user-facing API
+```
+
+**Output**: A `TASK.md` file in the project root with a complete, actionable plan.
+
+**Before implementing — create a checkpoint:**
+
+```bash
+git add -A && git commit -m "checkpoint: before implementing TASK.md"
+```
+
+This gives you a clean rollback point. If the implementation goes wrong:
+
+```bash
+git diff              # see what changed
+git checkout -- .     # revert everything to the checkpoint
+```
+
+**Then implement:**
+
+```
+implement the plan in TASK.md
+```
+
+---
+
 ### Session management
 
 Claude Code calls are session-persistent — the first Claude call creates a session, and every subsequent call continues it using `--resume`. This means Claude remembers what files it read, what plans it made, and what context it has across multiple tool calls.
@@ -418,7 +480,8 @@ Add `env` only if you need to override defaults on a specific machine (different
 | `NPX_CMD` | `~/.nvm/versions/node/v24.12.0/bin/npx` | Path to npx (for Gemini CLI) |
 | `GEMINI_PKG` | `@google/gemini-cli@latest` | npm package for Gemini CLI |
 | `NVM_NODE_VERSION` | `24.12.0` | nvm Node version (used to resolve npx path) |
-| `CLI_TIMEOUT` | `300` | Max seconds per CLI call before timeout |
+| `CLI_TIMEOUT` | `300` | Max seconds per CLI call before timeout (orchestrate uses 2x) |
+| `ORCHESTRATE_TIMEOUT` | `600` | Total seconds for the entire orchestration pipeline |
 | `PROJECT_ROOT` | current working directory | Root directory CLIs run from |
 
 ## Troubleshooting
@@ -431,6 +494,8 @@ Add `env` only if you need to override defaults on a specific machine (different
 
 **Claude errors with "CLI not found"**: Make sure Claude Code is installed and `claude` is on your PATH.
 
-**Timeout errors**: Increase `CLI_TIMEOUT` in env vars. Default is 5 minutes (300s). Complex tasks may need longer.
+**Timeout errors**: Increase `CLI_TIMEOUT` in env vars. Default is 5 minutes (300s). The `orchestrate` tool uses 2x the CLI timeout per step (10 min). For the total orchestration pipeline, use `ORCHESTRATE_TIMEOUT` (default 10 min). On timeout, partial results from completed steps are returned.
+
+**Orchestration seems stuck**: Check `.orchestrate-status` in the project root — it updates after each step with elapsed time. If the file is stale, the subprocess may have hung.
 
 **First Gemini call is slow**: `npx` downloads the package on first run. Subsequent calls use the cached version.

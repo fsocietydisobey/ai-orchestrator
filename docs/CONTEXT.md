@@ -41,7 +41,7 @@ You (working in Cursor IDE)
                                               → claude-opus-4-6
 ```
 
-The server is a single Python file (`src/orchestrator/cli_server.py`) using FastMCP. It spawns CLI subprocesses for each tool call, captures the output, and returns it to Cursor.
+The server is implemented in a modular package (`src/orchestrator/cli_server_pkg/`) with a thin entry point (`src/orchestrator/cli_server.py`). It uses FastMCP and spawns CLI subprocesses for each tool call, captures the output, and returns it to Cursor.
 
 ## Session persistence
 
@@ -54,7 +54,7 @@ Both Claude and Gemini calls are session-persistent within one MCP server lifeti
 
 **Limitation**: all Cursor chats share one Claude session and one Gemini session (MCP doesn't pass conversation IDs from the client). Use `new_session` when switching between unrelated tasks.
 
-## The 12 tools
+## The 13 tools
 
 ### Gemini tools (research and analysis — never writes code)
 
@@ -74,6 +74,14 @@ Both Claude and Gemini calls are session-persistent within one MCP server lifeti
 | `debug(error, context?)` | Root cause analysis | "debug", "why is ... failing" |
 | `test(target, context?)` | Generate test cases | "test", "write tests for" |
 | `document(target, style?)` | Generate documentation | "document", "write docs for" |
+
+### Orchestration tool
+
+| Tool | Purpose | Trigger keywords |
+|------|---------|-----------------|
+| `orchestrate(goal, context?)` | Multi-model deliberation → TASK.md | "orchestrate", "deliberate" |
+
+The orchestrate tool runs a full deliberation pipeline: Gemini researches the problem domain, Claude designs architecture against the codebase, they go back-and-forth to resolve open questions (up to 3 rounds), then Claude produces a TASK.md with Assessment, Research, Architecture, Open Questions, and Implementation Plan sections. **It does NOT implement anything** — the user must review TASK.md and explicitly approve before implementation. Each step gets a 10-minute timeout, with progress reported via MCP notifications and a `.orchestrate-status` file.
 
 ### Session and usage tools
 
@@ -112,12 +120,32 @@ Prefix any message with the model name to force routing:
      → Clears both sessions for a clean slate
 ```
 
+Or use `orchestrate` for complex tasks that need both research and architecture:
+
+```
+1. "orchestrate adding a WebSocket notification system"
+     → Gemini researches patterns, Claude designs architecture,
+       back-and-forth to resolve questions → produces TASK.md
+
+2. Review TASK.md — edit or approve the plan
+
+3. git add -A && git commit -m "checkpoint: before implementing TASK.md"
+     → Create a rollback point before implementation
+
+4. "implement the plan in TASK.md"
+     → Claude implements the plan step by step
+
+5. If something goes wrong: git checkout -- .
+     → Reverts to the checkpoint
+```
+
 ## Project structure
 
 ```
 ai-orchestrator/
 ├── src/orchestrator/
-│   ├── cli_server.py          ← THE MAIN FILE — MCP server with all 12 tools
+│   ├── cli_server.py          ← Entry point for Option A (delegates to cli_server_pkg)
+│   ├── cli_server_pkg/        ← MCP server implementation (config, helpers, tools)
 │   ├── server.py              ← LangGraph server (experimental, Option B)
 │   ├── config.py              ← Loads config.yaml (used by LangGraph server)
 │   ├── models.py              ← LangChain model factories (used by LangGraph server)
@@ -138,7 +166,7 @@ ai-orchestrator/
 ```
 
 **Two entry points** in `pyproject.toml`:
-- `ai-orchestrator` → `cli_server.py` (Option A — daily driver, CLI subprocesses)
+- `ai-orchestrator` → `cli_server.py` → `cli_server_pkg` (Option A — daily driver, CLI subprocesses)
 - `ai-orchestrator-graph` → `server.py` (Option B — experimental LangGraph pipeline)
 
 ## Setup on a new machine
@@ -201,7 +229,7 @@ Add to `~/.claude.json` under `mcpServers`:
 
 ## Configuration
 
-Defaults are baked into `cli_server.py`. Override via env vars in MCP config only if needed:
+Defaults are in `cli_server_pkg/config.py`. Override via env vars in MCP config only if needed:
 
 | Variable | Default | What it controls |
 |----------|---------|-----------------|
@@ -211,7 +239,8 @@ Defaults are baked into `cli_server.py`. Override via env vars in MCP config onl
 | `NPX_CMD` | `~/.nvm/versions/node/v24.12.0/bin/npx` | Path to npx (for Gemini CLI) |
 | `GEMINI_PKG` | `@google/gemini-cli@latest` | npm package for Gemini CLI |
 | `NVM_NODE_VERSION` | `24.12.0` | nvm Node version (resolves npx path) |
-| `CLI_TIMEOUT` | `300` | Seconds before subprocess timeout |
+| `CLI_TIMEOUT` | `300` | Seconds before subprocess timeout (orchestrate uses 2x) |
+| `ORCHESTRATE_TIMEOUT` | `600` | Total seconds for the entire orchestration pipeline |
 | `PROJECT_ROOT` | cwd | Root directory CLIs run from |
 
 ## Known limitations

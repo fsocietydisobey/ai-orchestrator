@@ -1,0 +1,54 @@
+---
+description: Routes keywords to ai-orchestrator MCP tools (Gemini, Claude, orchestrate)
+alwaysApply: true
+---
+
+# AI Orchestrator — MCP Tool Routing
+
+You have access to MCP tools from the `ai-orchestrator` server. Use them instead of your built-in tools when the situation matches.
+
+## Keyword triggers
+
+When the user starts a message with these keywords, ALWAYS use the corresponding MCP tool:
+
+- **"gemini, ..."** → Route to the appropriate Gemini tool (`research`, `explain`, or `compare`) based on intent
+- **"claude, ..."** → Route to the appropriate Claude tool (`architect`, `implement`, `review`, `debug`, `test`, or `document`) based on intent
+- **"research ..."** or **"deep dive ..."** or **"investigate ..."** → `research`
+- **"explain ..."** or **"what is ..."** or **"how does ... work"** → `explain`
+- **"compare ..."** or **"... vs ..."** or **"trade-offs ..."** → `compare`
+- **"plan ..."** or **"design ..."** or **"architect ..."** → `architect`
+- **"review ..."** or **"code review ..."** → `review`
+- **"debug ..."** or **"why is ... failing"** or **"root cause ..."** → `debug`
+- **"test ..."** or **"write tests for ..."** or **"generate tests ..."** → `test`
+- **"document ..."** or **"write docs for ..."** → `document`
+- **"orchestrate ..."** or **"deliberate ..."** → `orchestrate`
+
+## When to use MCP tools vs handle directly
+
+For straightforward coding tasks (simple bug fixes, small features, renaming, formatting, adding fields), handle them yourself — do NOT delegate to MCP tools. Only escalate when the task genuinely needs research, architecture, or is too complex for you.
+
+When the user says "gemini" or "claude" explicitly, ALWAYS route to that model's tools — never handle it yourself.
+
+## Tool reference
+
+### Gemini tools (research and analysis — NOT for writing code)
+- `research(question, context?)` — deep domain/technology exploration
+- `explain(code_or_concept, context?)` — explain unfamiliar code or concepts
+- `compare(option_a, option_b, context?)` — trade-off analysis between options
+
+### Claude tools (architecture, implementation, code quality — full codebase access)
+- `architect(goal, context?, constraints?)` — design implementation plans
+- `implement(spec, context?)` — complex implementation
+- `review(target, focus?)` — thorough code review
+- `debug(error, context?)` — root cause analysis
+- `test(target, context?)` — generate test cases
+- `document(target, style?)` — generate documentation
+
+### Orchestration (multi-model collaboration)
+- `orchestrate(goal, context?)` — Gemini researches + Claude architects in a back-and-forth deliberation loop, produces TASK.md
+  - **IMPORTANT:** After orchestrate completes, show the user the TASK.md for review. Do NOT auto-implement. Wait for explicit user approval before running `implement`. Recommend committing current state as a checkpoint before implementation (`git add -A && git commit -m "checkpoint: before implementing TASK.md"`).
+
+### Session management
+- `new_session()` — reset Claude + Gemini sessions for a fresh start
+- `claude_usage()` — token counts and costs
+- `gemini_usage()` — call counts for current session
