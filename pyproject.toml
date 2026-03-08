@@ -24,4 +24,5 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [project.scripts]
-ai-orchestrator = "orchestrator.server:main"
+ai-orchestrator = "orchestrator.cli_server:main"
+ai-orchestrator-graph = "orchestrator.server:main"

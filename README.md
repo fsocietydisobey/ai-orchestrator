@@ -231,27 +231,53 @@ cp .env.example .env
 #   OPENAI_API_KEY=sk-...        (for Codex implement node)
 ```
 
-### 3. Connect to Cursor
+### 3. Connect to Cursor (Option A — CLI server, recommended)
 
-Add to `.cursor/mcp.json` (project-level) or `~/.cursor/mcp.json` (global):
+Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project-level):
 
 ```json
 {
   "mcpServers": {
     "ai-orchestrator": {
       "command": "uv",
-      "args": ["--directory", "/path/to/ai-orchestrator", "run", "ai-orchestrator"],
+      "args": [
+        "--directory",
+        "/home/_3ntropy/dev/ai-orchestrator",
+        "run",
+        "ai-orchestrator"
+      ]
+    }
+  }
+}
+```
+
+This connects Cursor to the CLI server (Option A) which delegates to Claude Code (`claude -p`) and Gemini CLI (`npx @google/gemini-cli@latest`). No API keys needed — each CLI handles its own auth.
+
+### 4. Connect to Cursor (LangGraph server, experimental)
+
+To use the LangGraph pipeline (Option B) instead, swap the entry point and provide API keys:
+
+```json
+{
+  "mcpServers": {
+    "ai-orchestrator": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/home/_3ntropy/dev/ai-orchestrator",
+        "run",
+        "ai-orchestrator-graph"
+      ],
       "env": {
         "ANTHROPIC_API_KEY": "sk-ant-...",
-        "GOOGLE_AI_API_KEY": "AIza...",
-        "OPENAI_API_KEY": "sk-..."
+        "GOOGLE_AI_API_KEY": "AIza..."
       }
     }
   }
 }
 ```
 
-### 4. Connect to Claude Code
+### 5. Connect to Claude Code
 
 Add to `~/.claude.json` under `mcpServers`:
 
@@ -260,7 +286,12 @@ Add to `~/.claude.json` under `mcpServers`:
   "mcpServers": {
     "ai-orchestrator": {
       "command": "uv",
-      "args": ["--directory", "/path/to/ai-orchestrator", "run", "ai-orchestrator"]
+      "args": [
+        "--directory",
+        "/home/_3ntropy/dev/ai-orchestrator",
+        "run",
+        "ai-orchestrator"
+      ]
     }
   }
 }
@@ -427,3 +458,97 @@ graph LR
 - [ ] Custom roles — define new nodes in `config.yaml` with custom prompts
 - [ ] Streamable HTTP transport — for remote hosting beyond stdio
 - [ ] Rate limiting and circuit breakers per provider
+
+---
+
+## Future direction: CLI-native orchestration
+
+The current architecture gives models codebase access through custom filesystem tools (read_file, glob, grep). This works, but CLI tools like Claude Code and Gemini CLI provide **much richer codebase context natively** — they have built-in indexing, search heuristics, and context management that a ReAct agent discovering files one tool call at a time can't match.
+
+Two planned approaches address this, both exposed through the same MCP server:
+
+### Option A — Cursor as orchestrator (primary workflow)
+
+Cursor is the primary IDE and handles implementation for ~95% of tasks. The MCP server gives Cursor access to two additional models for the cases where it needs help:
+
+- **Gemini** for research — deep domain exploration, technology investigation, understanding unknowns. Gemini has strong research skills but is weak at writing code.
+- **Claude Code** for complex implementation — multi-file coordination, intricate refactors, tasks where Cursor's built-in models struggle. Claude Code runs headlessly via `claude -p` with full codebase access.
+
+```mermaid
+graph TD
+    You -->|work in| Cursor[Cursor IDE]
+
+    Cursor -->|needs research| MCP[MCP Server]
+    Cursor -->|complex task| MCP
+
+    MCP -->|research| Gemini[Gemini CLI / API<br/>research only]
+    MCP -->|architect + implement| Claude[Claude Code<br/>claude -p]
+
+    Gemini -->|findings| MCP
+    Claude -->|plan or code| MCP
+    MCP -->|result| Cursor
+
+    Cursor -->|simple tasks| Cursor
+
+    style Cursor fill:#1a1a2e,stroke:#e94560,color:#fff
+    style MCP fill:#0d1117,stroke:#58a6ff,color:#fff
+    style Gemini fill:#1a73e8,stroke:#fff,color:#fff
+    style Claude fill:#c45a2c,stroke:#fff,color:#fff
+```
+
+**The workflow**:
+1. You work in Cursor as usual. It handles most tasks directly.
+2. When you need research on a topic/technology, Cursor calls `research()` → Gemini explores and returns findings.
+3. When a task is too complex for Cursor's models, Cursor calls `architect()` or `implement()` → Claude Code takes over with full codebase context, returns a plan or writes code directly.
+
+**Why this split**: Each model does what it's best at. Cursor is fast and handles the majority of day-to-day coding. Gemini is strong at research and exploration but shouldn't be writing code. Claude Code is the heavy hitter for complex architecture and implementation that Cursor can't handle alone.
+
+**What to build**:
+- [ ] Gemini CLI subprocess wrapper — async provider that calls `gemini -p "..."` with `cwd` set to the project root
+- [ ] Claude Code subprocess wrapper — async provider that calls `claude -p "..."` with codebase access
+- [ ] MCP server with `research(question)` → Gemini and `architect(goal)` / `implement(spec)` → Claude Code
+- [ ] Fallback to API providers when CLIs aren't installed
+
+### Option B — LangGraph with CLI subprocesses (experimental)
+
+Keep the full LangGraph pipeline for experimenting with multi-agent coordination, but swap the ReAct agents (API + custom filesystem tools) for CLI subprocess calls. Each model gets native codebase access instead of discovering files one tool call at a time.
+
+```mermaid
+graph TD
+    MCP[MCP Server] -->|chain tool| Graph[LangGraph StateGraph]
+
+    Graph --> Classify{Classify<br/>Haiku API}
+    Classify -->|needs research| Research[Research<br/>gemini -p]
+    Classify -->|needs design| Architect[Architect<br/>claude -p]
+    Classify -->|ready to code| Implement[Implement<br/>claude -p]
+
+    Research -->|findings → state| Architect
+    Architect -->|plan → state| Implement
+    Implement -->|result| MCP
+
+    style MCP fill:#0d1117,stroke:#58a6ff,color:#fff
+    style Classify fill:#161b22,stroke:#8b949e,color:#fff
+    style Research fill:#1a73e8,stroke:#fff,color:#fff
+    style Architect fill:#c45a2c,stroke:#fff,color:#fff
+    style Implement fill:#2d6a4f,stroke:#fff,color:#fff
+```
+
+Each node shells out to a CLI tool (`claude -p "..."`, `gemini -p "..."`) from the project directory so they inherit full codebase context automatically. LangGraph handles routing, state accumulation, and coordination. The custom filesystem tools become unnecessary.
+
+**What to build**:
+- [ ] CLI subprocess provider — async wrapper around `claude -p` and `gemini -p`
+- [ ] Rewire research node to use `gemini -p` subprocess
+- [ ] Rewire architect node to use `claude -p` subprocess
+- [ ] Implement node using `claude -p` with write permissions
+- [ ] Fallback to API providers when CLIs aren't installed
+- [ ] Remove custom filesystem tools once CLI nodes are stable
+
+**Why keep LangGraph**: This is the testbed for advanced agent patterns — self-reflection loops, checkpoints, time-travel, critique nodes. The graph adds value when experimenting with *how agents coordinate*, not just calling individual models.
+
+### CLI tool capabilities
+
+| Tool | Headless mode | Codebase-aware | Role in orchestrator |
+|------|--------------|----------------|---------------------|
+| **Cursor** | No (IDE only) | Yes (IDE only) | Orchestrator — handles ~95% of tasks directly, delegates research and complex tasks via MCP |
+| **Claude Code** | `claude -p "..."` | Yes (native) | Complex architecture and implementation — the fallback when Cursor's models aren't enough |
+| **Gemini CLI** | `gemini -p "..."` | Yes (native) | Research only — strong at exploration, weak at writing code |

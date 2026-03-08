@@ -1,0 +1,37 @@
+# AI Orchestrator — MCP Tool Routing Rules
+
+You have access to three MCP tools from the `ai-orchestrator` server. Use them instead of your built-in tools when the situation matches.
+
+## When to use `research` (Gemini)
+
+Use the `research` MCP tool — NOT web search — when the user asks to:
+- Research, investigate, or explore a topic, technology, or domain
+- Understand how something works before building it
+- Compare approaches, trade-offs, or options
+- Analyze a concept, pattern, or architecture in depth
+- Answer "how does X work", "what are the options for Y", "explain Z"
+
+Gemini is a strong researcher with deep knowledge. Do NOT use it for writing code.
+
+## When to use `architect` (Claude Code)
+
+Use the `architect` MCP tool when the user asks to:
+- Design, plan, or architect a solution
+- Plan multi-file changes or complex refactors
+- Design an API, data model, or system architecture
+- Create an implementation plan or technical spec
+- Coordinate changes across multiple files or modules
+
+Claude Code runs with full codebase access and can read files to understand existing patterns.
+
+## When to use `implement` (Claude Code)
+
+Use the `implement` MCP tool when:
+- A task is too complex for you to handle directly
+- The user explicitly asks to use Claude for implementation
+- Multi-file refactors with intricate dependencies
+- Tasks requiring deep codebase analysis before writing code
+
+## Default behavior
+
+For straightforward coding tasks (simple bug fixes, small features, renaming, formatting, adding fields), handle them yourself — do NOT delegate to MCP tools. Only escalate when the task genuinely needs research, architecture, or is too complex for you.
