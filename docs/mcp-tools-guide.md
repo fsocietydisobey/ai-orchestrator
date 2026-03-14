@@ -499,3 +499,58 @@ Add `env` only if you need to override defaults on a specific machine (different
 **Orchestration seems stuck**: Check `.orchestrate-status` in the project root — it updates after each step with elapsed time. If the file is stale, the subprocess may have hung.
 
 **First Gemini call is slow**: `npx` downloads the package on first run. Subsequent calls use the cached version.
+
+---
+
+## Option B — LangGraph Pipeline Tools
+
+If you're running `ai-orchestrator-graph` instead of `ai-orchestrator`, you get a different set of tools backed by a LangGraph StateGraph with checkpoints, self-reflection, and time-travel.
+
+### `chain(task, context?, thread_id?)`
+
+Auto-route a task through the full LangGraph pipeline: classify → research → architect → implement. Each step is checkpointed. Critique nodes score output quality and retry if low.
+
+Pass `thread_id` to continue a previous chain. Omit for a new thread.
+
+```
+chain "Add a health check endpoint that returns uptime and tool count"
+
+# Continue a previous chain
+chain "Now add error handling to that plan" thread_id: "abc-123"
+```
+
+Returns a thread_id in the response for follow-ups.
+
+### `history(thread_id, limit?)`
+
+Show checkpoint history for a chain thread. Each checkpoint shows: step number, what state exists, quality scores, and next node.
+
+```
+history "abc-123"
+```
+
+Use checkpoint IDs from the output with `rewind()`.
+
+### `rewind(thread_id, checkpoint_id, new_task?)`
+
+Rewind to a previous checkpoint and re-run the graph from that point. Optionally provide a new task to change direction.
+
+```
+# Rewind to after research, re-run architect with different constraints
+rewind "abc-123" "1f11fb64-c4f..." new_task: "Add WebSocket support using SSE instead"
+```
+
+### `classify(task_description)`
+
+Fast classification using Haiku. Returns tier (research/architect/implement), confidence, reasoning, and recommended pipeline.
+
+### `research(question, context?)` / `architect(goal, context?, constraints?)`
+
+Direct CLI calls (same as Option A) without going through the graph pipeline.
+
+### Quality scores
+
+The chain output includes a **Quality Scores** section when critique nodes run:
+- Score >= 0.7: passed on first attempt
+- Score < 0.7: retried with critique feedback (max 2 attempts)
+- Both research and architect scores are shown

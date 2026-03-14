@@ -1,100 +1,95 @@
-"""LangGraph StateGraph construction — wires classify → research → architect.
+"""LangGraph StateGraph — v0.4 Dynamic Supervisor pattern.
 
-The graph routes tasks through a pipeline determined by the classify node:
-    - research tasks: classify → research → architect → END
-    - architect tasks: classify → architect → END
-    - implement tasks: classify → END (placeholder, returns static message)
+Hub-and-spoke architecture: every node returns to the supervisor, which
+inspects the full state and decides what to do next (or terminate).
 
-No checkpointer — each invocation is stateless.
+    supervisor → research → supervisor → architect → supervisor → implement → supervisor → END
+             ↑                                                                    |
+             └──────────────── every node returns here ───────────────────────────┘
+
+Features:
+    - Dynamic routing via Pydantic RouterDecision (structured LLM output)
+    - Self-healing: supervisor detects failure and retries with feedback
+    - Checkpoints via InMemorySaver for time-travel
+    - Supervisor uses cheap API model (Haiku). Domain nodes use CLI subprocesses.
 """
 
-from typing import Literal
-
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from .config import OrchestratorConfig
-from .models import get_architect_model, get_classify_model, get_research_model
+from .models import get_classify_model
 from .nodes import (
     build_architect_node,
-    build_classify_node,
     build_implement_node,
     build_research_node,
+    build_supervisor_node,
+    build_validator_node,
 )
 from .state import OrchestratorState
-from .tools import READ_TOOLS
+
+# Shared checkpointer — persists state across invocations within the server lifetime
+checkpointer = InMemorySaver()
 
 
-def route_after_classify(
-    state: OrchestratorState,
-) -> Literal["research", "architect", "end"]:
-    """Route to the next node based on the classification pipeline.
-
-    Reads the `pipeline` field from classification and returns the first
-    relevant step: 'research' if research is needed, 'architect' if only
-    architecture is needed, or 'end' for pure implement tasks.
-    """
-    classification = state.get("classification", {})
-    pipeline = classification.get("pipeline", ["architect", "implement"])
-
-    if "research" in pipeline:
-        return "research"
-    elif "architect" in pipeline:
-        return "architect"
-    else:
-        # Pure implement or unknown — go to end
-        return "end"
+def select_next_node(state: OrchestratorState) -> str:
+    """Read the supervisor's decision and route to the next node."""
+    next_node = state.get("next_node", "finish")
+    if next_node == "finish":
+        return END
+    return next_node
 
 
 def build_orchestrator_graph(config: OrchestratorConfig):
-    """Build and compile the orchestrator StateGraph.
+    """Build and compile the orchestrator StateGraph with dynamic supervisor.
 
-    Creates LangChain models from config, builds node functions with tools,
-    and wires the graph edges.
+    The supervisor (Haiku) makes routing decisions. Domain nodes (research,
+    architect, implement) use CLI subprocesses. Validator (Haiku) scores output.
 
     Args:
         config: OrchestratorConfig with provider/role definitions.
 
     Returns:
-        Compiled StateGraph ready for .ainvoke().
+        Compiled StateGraph with InMemorySaver checkpointer.
     """
-    # --- Build models from config ---
-    classify_model = get_classify_model(config)
-    research_model = get_research_model(config)
-    architect_model = get_architect_model(config)
+    # Supervisor and validator use a cheap/fast API model
+    supervisor_model = get_classify_model(config)
 
-    # --- Build node functions ---
-    classify_node = build_classify_node(classify_model)
-    research_node = build_research_node(research_model, READ_TOOLS)
-    architect_node = build_architect_node(architect_model, READ_TOOLS)
+    supervisor_node = build_supervisor_node(supervisor_model)
+    validator_node = build_validator_node(supervisor_model)
+    research_node = build_research_node()
+    architect_node = build_architect_node()
     implement_node = build_implement_node()
 
     # --- Wire the graph ---
     graph = StateGraph(OrchestratorState)
 
-    # Add nodes
-    graph.add_node("classify", classify_node)
+    graph.add_node("supervisor", supervisor_node)
     graph.add_node("research", research_node)
     graph.add_node("architect", architect_node)
     graph.add_node("implement", implement_node)
+    graph.add_node("validator", validator_node)
 
-    # Entry edge: START → classify
-    graph.add_edge(START, "classify")
+    # Entry: START → supervisor (supervisor makes the first decision)
+    graph.add_edge(START, "supervisor")
 
-    # Conditional routing after classify
+    # Supervisor routes dynamically
     graph.add_conditional_edges(
-        "classify",
-        route_after_classify,
+        "supervisor",
+        select_next_node,
         {
             "research": "research",
             "architect": "architect",
-            "end": "implement",  # placeholder node, then END
+            "implement": "implement",
+            "validator": "validator",
+            END: END,
         },
     )
 
-    # Sequential edges: research → architect, architect → END, implement → END
-    graph.add_edge("research", "architect")
-    graph.add_edge("architect", END)
-    graph.add_edge("implement", END)
+    # Every node returns to supervisor
+    graph.add_edge("research", "supervisor")
+    graph.add_edge("architect", "supervisor")
+    graph.add_edge("implement", "supervisor")
+    graph.add_edge("validator", "supervisor")
 
-    # Compile without checkpointer (stateless MCP calls)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)

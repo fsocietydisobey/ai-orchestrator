@@ -389,7 +389,8 @@ ai-orchestrator/
 │   │   ├── classify.py        # Classifier node (Haiku — fast routing)
 │   │   ├── research.py        # Research node (Gemini — ReAct agent)
 │   │   ├── architect.py       # Architect node (Claude — ReAct agent)
-│   │   └── implement.py       # Implement node (placeholder for v0.3)
+│   │   ├── implement.py       # Implement node (Claude Code CLI)
+│   │   └── critique.py       # Self-reflection critique nodes (Haiku)
 │   ├── tools/
 │   │   ├── __init__.py        # Exports READ_TOOLS, WRITE_TOOLS
 │   │   └── filesystem.py      # read_file, glob, grep, list_dir, write_file
@@ -423,25 +424,28 @@ ai-orchestrator/
 
 **Two execution paths**: Direct tools (`research()`, `architect()`, `classify()`) still use the `Router` + raw providers for fast, cheap calls. The `chain()` tool uses the LangGraph graph internally with filesystem tools.
 
-### v0.3 — Agent intelligence
+### v0.3 — Agent intelligence (done)
 
-Self-reflection, self-correction, checkpoints, and time-travel — the mechanics that turn a simple pipeline into a robust agent.
+Self-reflection, self-correction, checkpoints, and time-travel.
 
-| Feature | How it fits | Complexity |
-|---|---|---|
-| **Self-reflection** | After research/architect nodes, add a "critique" node that reviews output quality and loops back if weak. Uses a cheap model (Haiku) to score the output, retries the node if below threshold. | Medium |
-| **Self-correction** | Architect node validates its own plan against the actual codebase — catches hallucinated file paths, non-existent functions, wrong import paths. Runs a verification pass before returning. | Medium |
-| **Checkpoints** | Add `MemorySaver` or `AsyncPostgresSaver` so multi-turn chains accumulate context across calls. Enables follow-up questions like "now add error handling to that plan". | Low |
-| **Time-travel / revert** | LangGraph's built-in state history — `get_state_history(thread_id)` returns all state snapshots. Expose an MCP tool like `rewind(thread_id, checkpoint_id)` to replay from any point. Run research → architect, don't like the architecture, revert to post-research and re-run architect with different constraints. | Medium |
-| **Implement node** | Wire up Codex / GPT-4o as the implement node with `write_file` tool. Takes the architect's plan and generates actual code changes. | Medium |
+- [x] **Checkpoints** — `InMemorySaver` with `thread_id` support. Multi-turn chains accumulate context across calls.
+- [x] **Time-travel / revert** — `history(thread_id)` shows all checkpoints. `rewind(thread_id, checkpoint_id)` replays from any point with optional new task.
+- [x] **Self-reflection** — Critique nodes (Haiku) score research/architect output 0.0-1.0. Loops back with feedback if score < 0.7 (max 2 attempts).
+- [x] **Self-correction** — Architect node validates file paths and function names against the actual codebase before finalizing.
+- [x] **Implement node** — Claude Code CLI with full read/write codebase access. No longer a placeholder.
+- [x] **CLI subprocess migration** — Research, architect, and implement nodes use `run_gemini`/`run_claude` (shared with Option A) instead of API + ReAct agents.
 
 ```mermaid
 graph LR
-    subgraph "v0.3 Agent Loop"
-        A[Node Output] --> B{Critique<br/>Haiku}
-        B -->|score < threshold| C[Retry Node]
-        C --> A
-        B -->|score >= threshold| D[Next Node]
+    subgraph "v0.3 Pipeline (current)"
+        CL[classify] --> R[research]
+        R --> RC{research<br/>critique}
+        RC -->|score < 0.7| R
+        RC -->|score >= 0.7| A[architect]
+        A --> AC{architect<br/>critique}
+        AC -->|score < 0.7| A
+        AC -->|score >= 0.7| I[implement]
+        I --> END_
     end
 
     subgraph "v0.3 Time Travel"
@@ -451,7 +455,38 @@ graph LR
     end
 ```
 
-### v0.4 — Production features
+**New MCP tools (Option B)**: `chain(task, context?, thread_id?)`, `history(thread_id)`, `rewind(thread_id, checkpoint_id, new_task?)`
+
+### v0.4 — Dynamic Supervisor
+
+Replace the linear pipeline with a hub-and-spoke supervisor pattern. Instead of a one-shot classifier routing to a predetermined path, a recurring supervisor inspects the full state after every node and dynamically decides what to do next.
+
+| Feature | How it fits | Complexity |
+|---|---|---|
+| **Supervisor node** | Central decision-maker that runs after every node. Inspects full state (history, scores, findings) and picks the next node or terminates. Uses structured output (Pydantic `RouterDecision`). | Medium |
+| **Dynamic routing** | Every node returns to the supervisor. It can skip nodes, reorder them, call the same node twice with different instructions, or terminate early. The flow is fully LLM-driven, not hardcoded. | Medium |
+| **Self-healing** | When a node fails or scores low, the supervisor uses `update_state()` to fork the graph history, inject a hint at a past checkpoint, and re-run from there — automatically, not via manual `rewind()`. | Hard |
+| **Pydantic RouterDecision** | Structured output schema: `next_step` (which node), `rationale` (why), `instructions` (what to tell the node). Type-safe, validated, extensible. | Low |
+
+```mermaid
+graph TD
+    S{Supervisor} -->|needs research| R[Research<br/>Gemini CLI]
+    S -->|needs design| A[Architect<br/>Claude CLI]
+    S -->|ready to code| I[Implement<br/>Claude CLI]
+    S -->|quality check| V[Validator]
+    S -->|done| END_[END]
+
+    R --> S
+    A --> S
+    I --> S
+    V --> S
+
+    style S fill:#e94560,stroke:#fff,color:#fff
+```
+
+The supervisor replaces both `classify` and the critique nodes — it handles routing, quality assessment, and retry logic in one place. Adding new nodes only requires updating the `RouterDecision` literal and the conditional edge map.
+
+### v0.5 — Production features
 
 - [ ] Cost tracking — log token usage per node per request
 - [ ] Streaming — `astream(stream_mode=["messages", "updates"])` for real-time output

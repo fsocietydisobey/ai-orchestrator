@@ -1,68 +1,56 @@
-"""Architect node — ReAct agent with filesystem tools for design/planning.
+"""Architect node — shells out to Claude Code CLI for design/planning.
 
-Uses create_react_agent to give the architect model file-reading capability.
-If research findings exist in state, they're included in the prompt so the
-architect builds on prior exploration.
+Claude Code runs from the project root with native codebase access.
+Includes self-correction: validates file paths and function names against
+the actual codebase before finalizing.
 """
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage
-from langchain_core.tools import BaseTool
-from langgraph.prebuilt import create_react_agent
-
+from ..cli_server_pkg.helpers.prompts import build_prompt
+from ..cli_server_pkg.session.runners import run_claude
 from ..prompts import ARCHITECT_SYSTEM_PROMPT
 from ..state import OrchestratorState
 
 
-def build_architect_node(model: BaseChatModel, tools: list[BaseTool]):
-    """Build an architect node backed by a ReAct agent with filesystem tools.
-
-    The agent receives the task description (plus research findings if
-    available), reads relevant code files, and produces a structured
-    implementation plan.
-
-    Args:
-        model: LangChain chat model configured for architecture.
-        tools: List of filesystem tools the agent can use.
+def build_architect_node():
+    """Build an architect node that uses Claude Code CLI.
 
     Returns:
         Async node function compatible with LangGraph StateGraph.
     """
-    architect_agent = create_react_agent(
-        model=model,
-        tools=tools,
-        prompt=ARCHITECT_SYSTEM_PROMPT,
-    )
 
     async def architect_node(state: OrchestratorState) -> dict:
-        """Run the architect agent and return the implementation plan."""
+        """Run Claude Code architecture and return the plan."""
         task = state.get("task", "")
         context = state.get("context", "")
         research_findings = state.get("research_findings", "")
+        instructions = state.get("supervisor_instructions", "")
+        feedback = state.get("validation_feedback", "")
+        node_calls = dict(state.get("node_calls", {}))
+        history = list(state.get("history", []))
 
-        # Build the user message — include context and research findings
-        parts = [task]
-        if context:
-            parts.append(f"## Context\n\n{context}")
-        if research_findings:
-            parts.append(f"## Research Findings\n\n{research_findings}")
-        prompt = "\n\n".join(parts)
+        # Track call count
+        node_calls["architect"] = node_calls.get("architect", 0) + 1
 
-        # Invoke the ReAct agent
-        result = await architect_agent.ainvoke(
-            {"messages": [HumanMessage(content=prompt)]}
+        prompt = build_prompt(
+            ARCHITECT_SYSTEM_PROMPT,
+            task,
+            f"## Context\n\n{context}" if context else "",
+            f"## Research Findings\n\n{research_findings}" if research_findings else "",
+            f"## Supervisor instructions\n\n{instructions}" if instructions else "",
+            f"## Previous feedback to address\n\n{feedback}" if feedback else "",
+            # Self-correction
+            "## Self-correction\n\n"
+            "Before finalizing your plan, verify that every file path and function "
+            "name you reference actually exists in the codebase. Read the files to "
+            "confirm. If you find a hallucinated path or name, fix it.",
         )
 
-        # Extract the final AI message content as the architecture plan
-        plan = ""
-        if result.get("messages"):
-            last_msg = result["messages"][-1]
-            plan = (
-                last_msg.content
-                if isinstance(last_msg.content, str)
-                else str(last_msg.content)
-            )
+        plan = await run_claude(prompt, timeout=600)
 
-        return {"architecture_plan": plan}
+        return {
+            "architecture_plan": plan,
+            "node_calls": node_calls,
+            "history": history + [f"architect: completed (attempt {node_calls['architect']})"],
+        }
 
     return architect_node

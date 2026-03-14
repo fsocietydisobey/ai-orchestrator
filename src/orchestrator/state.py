@@ -19,25 +19,63 @@ class OrchestratorState(TypedDict, total=False):
         task: The user's task description.
 
     Optional fields (set by nodes as they execute):
-        context: User-provided context (file contents, prior findings).
-        classification: Dict from the classify node (tier, confidence, etc.).
+        context: User-provided context.
         messages: Chat message history — uses add_messages reducer.
+
+    Domain outputs (set by domain nodes):
         research_findings: Markdown output from the research node.
         architecture_plan: Markdown output from the architect node.
-        implementation_result: Output from the implement node (placeholder).
+        implementation_result: Output from the implement node.
+
+    Supervisor fields (v0.4 — dynamic supervisor pattern):
+        next_node: Which node the supervisor wants to call next.
+        supervisor_rationale: Why the supervisor chose that node.
+        supervisor_instructions: Instructions for the next node.
+        history: List of step summaries (supervisor decisions, node results).
+        node_calls: Dict tracking how many times each node has been called.
+
+    Validation fields:
+        validation_score: 0.0-1.0 quality score from the validator.
+        validation_feedback: Actionable feedback if score is low.
+
+    Legacy fields (v0.3 — kept for backward compatibility):
+        classification: Dict from the classify node (tier, confidence, etc.).
+        research_score: Quality score from research critique.
+        research_critique: Feedback from research critique.
+        research_attempts: Number of research attempts.
+        architect_score: Quality score from architect critique.
+        architect_critique: Feedback from architect critique.
+        architect_attempts: Number of architect attempts.
     """
 
-    # --- Input (set before graph.ainvoke) ---
+    # --- Input ---
     task: str
     context: str
 
-    # --- Set by classify node ---
-    classification: dict[str, Any]
-
-    # --- Chat history (accumulates via add_messages reducer) ---
+    # --- Chat history ---
     messages: Annotated[list[AnyMessage], add_messages]
 
-    # --- Set by domain nodes ---
+    # --- Domain outputs ---
     research_findings: str
     architecture_plan: str
     implementation_result: str
+
+    # --- Supervisor (v0.4) ---
+    next_node: str
+    supervisor_rationale: str
+    supervisor_instructions: str
+    history: list[str]
+    node_calls: dict[str, int]
+
+    # --- Validation ---
+    validation_score: float
+    validation_feedback: str
+
+    # --- Legacy (v0.3) ---
+    classification: dict[str, Any]
+    research_score: float
+    research_critique: str
+    research_attempts: int
+    architect_score: float
+    architect_critique: str
+    architect_attempts: int

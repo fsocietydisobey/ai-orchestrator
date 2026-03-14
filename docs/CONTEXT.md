@@ -250,6 +250,39 @@ Defaults are in `cli_server_pkg/config.py`. Override via env vars in MCP config 
 - **First Gemini call is slow**: `npx` downloads the package on first run. Cached after that.
 - **nvm dependency**: Gemini CLI requires npx from a specific nvm Node version. The server resolves the absolute path to npx since nvm isn't loaded in subprocess shells.
 
-## Future work (Option B — LangGraph)
+## Option B — LangGraph Pipeline (v0.3)
 
-The `server.py` + `graph.py` + `nodes/` code is an experimental LangGraph pipeline that routes tasks through classify → research → architect → implement. It uses the same models but through API calls with custom filesystem tools instead of CLI subprocesses. It's a testbed for advanced agent patterns (self-reflection, checkpoints, time-travel). See the README for the full roadmap.
+The `server.py` + `graph.py` + `nodes/` code is a LangGraph pipeline with checkpoints, self-reflection, and time-travel. It shares CLI runners with Option A (`run_claude`/`run_gemini`) but adds stateful graph coordination.
+
+### Current architecture (v0.3 — linear with critique loops)
+
+```
+classify → research → research_critique → [retry?] → architect → architect_critique → [retry?] → implement → END
+```
+
+- **Classify**: Cheap API call (Haiku) routes tasks to research/architect/implement
+- **Research/Architect/Implement**: CLI subprocesses (Gemini/Claude) with 10-min timeouts
+- **Critique nodes**: Haiku scores output 0.0-1.0, loops back with feedback if < 0.7 (max 2 attempts)
+- **Checkpoints**: `InMemorySaver` — every node transition is checkpointed with thread_id
+- **Time-travel**: `history(thread_id)` lists checkpoints, `rewind(thread_id, checkpoint_id)` replays from any point
+
+### MCP tools (Option B)
+
+| Tool | Purpose |
+|------|---------|
+| `research(question, context?)` | Direct Gemini CLI call |
+| `architect(goal, context?, constraints?)` | Direct Claude CLI call |
+| `classify(task_description)` | Fast Haiku classification |
+| `chain(task, context?, thread_id?)` | Full pipeline with checkpoints |
+| `history(thread_id, limit?)` | Show checkpoint history |
+| `rewind(thread_id, checkpoint_id, new_task?)` | Replay from a past checkpoint |
+
+### Next: v0.4 — Dynamic Supervisor
+
+Replace the linear pipeline with a hub-and-spoke supervisor. Instead of a one-shot classify → predetermined path, a recurring supervisor node inspects the full state after every node and dynamically decides what to do next (or terminate). Uses Pydantic structured output (`RouterDecision`) for type-safe routing. The supervisor also handles self-healing — on failure, it uses `update_state()` to fork history and re-run from a past checkpoint automatically.
+
+```
+supervisor → research → supervisor → architect → supervisor → implement → supervisor → END
+         ↑                                                                    |
+         └──────────────── every node returns here ───────────────────────────┘
+```

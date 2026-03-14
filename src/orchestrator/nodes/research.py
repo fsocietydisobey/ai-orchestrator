@@ -1,64 +1,48 @@
-"""Research node — ReAct agent with filesystem tools for deep exploration.
+"""Research node — shells out to Gemini CLI for deep exploration.
 
-Uses create_react_agent to give the research model the ability to read files,
-search code, and explore directories. The agent autonomously decides which
-files to read based on the task description.
+Gemini CLI runs from the project root with native codebase access.
+Incorporates supervisor instructions and validation feedback on retries.
 """
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage
-from langchain_core.tools import BaseTool
-from langgraph.prebuilt import create_react_agent
-
+from ..cli_server_pkg.helpers.prompts import build_prompt
+from ..cli_server_pkg.session.runners import run_gemini
 from ..prompts import RESEARCH_SYSTEM_PROMPT
 from ..state import OrchestratorState
 
 
-def build_research_node(model: BaseChatModel, tools: list[BaseTool]):
-    """Build a research node backed by a ReAct agent with filesystem tools.
-
-    The agent receives the task description, uses tools to explore the
-    codebase, and returns structured research findings.
-
-    Args:
-        model: LangChain chat model configured for research.
-        tools: List of filesystem tools the agent can use.
+def build_research_node():
+    """Build a research node that uses Gemini CLI.
 
     Returns:
         Async node function compatible with LangGraph StateGraph.
     """
-    # Build a standalone ReAct agent (not compiled with a checkpointer)
-    research_agent = create_react_agent(
-        model=model,
-        tools=tools,
-        prompt=RESEARCH_SYSTEM_PROMPT,
-    )
 
     async def research_node(state: OrchestratorState) -> dict:
-        """Run the research agent and return findings."""
+        """Run Gemini CLI research and return findings."""
         task = state.get("task", "")
         context = state.get("context", "")
+        instructions = state.get("supervisor_instructions", "")
+        feedback = state.get("validation_feedback", "")
+        node_calls = dict(state.get("node_calls", {}))
+        history = list(state.get("history", []))
 
-        # Build the user message
-        prompt = task
-        if context:
-            prompt = f"{task}\n\n## Context\n\n{context}"
+        # Track call count
+        node_calls["research"] = node_calls.get("research", 0) + 1
 
-        # Invoke the ReAct agent
-        result = await research_agent.ainvoke(
-            {"messages": [HumanMessage(content=prompt)]}
+        prompt = build_prompt(
+            RESEARCH_SYSTEM_PROMPT,
+            task,
+            f"## Context\n\n{context}" if context else "",
+            f"## Supervisor instructions\n\n{instructions}" if instructions else "",
+            f"## Previous feedback to address\n\n{feedback}" if feedback else "",
         )
 
-        # Extract the final AI message content as research findings
-        findings = ""
-        if result.get("messages"):
-            last_msg = result["messages"][-1]
-            findings = (
-                last_msg.content
-                if isinstance(last_msg.content, str)
-                else str(last_msg.content)
-            )
+        findings = await run_gemini(prompt, timeout=600)
 
-        return {"research_findings": findings}
+        return {
+            "research_findings": findings,
+            "node_calls": node_calls,
+            "history": history + [f"research: completed (attempt {node_calls['research']})"],
+        }
 
     return research_node
