@@ -766,11 +766,11 @@ These are fast, single-model calls for when you know exactly which model you nee
 - `history(thread_id, limit?)` → reads checkpoints from the checkpointer
 - `rewind(thread_id, checkpoint_id, new_task?)` → loads a checkpoint, re-invokes graph
 
-### The `chain()` Tool — Full Pipeline
+### The `chain()` Tool — Full Pipeline with Streaming
 
 ```python
 @mcp.tool()
-async def chain(task_description: str, context: str = "", thread_id: str = "") -> str:
+async def chain(task_description: str, ctx: Context, context: str = "", thread_id: str = "") -> str:
     if not thread_id:
         thread_id = str(uuid.uuid4())
 
@@ -780,18 +780,43 @@ async def chain(task_description: str, context: str = "", thread_id: str = "") -
         initial_state["context"] = context
 
     graph = _get_graph()
-    result = await graph.ainvoke(initial_state, config=graph_config)
 
-    formatted = _format_graph_result(result)
-    return f"**Thread:** `{thread_id}`\n\n{formatted}"
+    # Stream updates — get real-time progress
+    result = {}
+    step = 0
+    async for update in graph.astream(initial_state, config=graph_config, stream_mode="updates"):
+        step += 1
+        for node_name, state_update in update.items():
+            result.update(state_update)
+            message = _build_progress_message(node_name, state_update)
+            await ctx.report_progress(step, message=message)
+
+    # ... check for HITL pause, format result ...
 ```
 
 Step by step:
 1. Generate a thread_id (or use the one provided for multi-turn)
 2. Create the initial state dict
 3. Get (or build) the graph
-4. Invoke the graph — this runs the full supervisor loop until `END`
-5. Format the result and return
+4. **Stream** the graph via `astream(stream_mode="updates")` instead of `ainvoke()`
+5. After each node completes, `_build_progress_message()` formats a short update
+6. `ctx.report_progress()` sends an MCP progress notification to the IDE
+7. If the graph pauses at `human_review`, return the plan with approval instructions
+8. Otherwise, format the final result and return
+
+### Streaming Progress — How It Works
+
+`graph.astream(stream_mode="updates")` yields a dict after each node completes. The dict is `{node_name: state_update}` — the same state update the node returned.
+
+`_build_progress_message()` extracts the relevant info from each node's update:
+- **Supervisor:** shows the routing decision, rationale, and fan-out topics
+- **Validator:** shows the quality score and feedback
+- **Research/Architect/Implement:** shows completion status and topic labels
+- **Human Review:** shows the approval/rejection status
+
+`ctx.report_progress(step, message=message)` sends an MCP `notifications/progress` message to the IDE. FastMCP injects the `Context` object automatically when the function declares a `ctx: Context` parameter.
+
+The key difference from `ainvoke()`: with streaming, the IDE sees progress **while the pipeline runs** — each supervisor decision, each validation score, each node completion appears in real time. Without streaming, you wait for the entire pipeline to finish before seeing anything.
 
 The `thread_id` is returned in the response so the caller can continue the chain later.
 

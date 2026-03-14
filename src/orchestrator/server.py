@@ -15,7 +15,7 @@ import uuid
 
 from dotenv import load_dotenv
 from langgraph.types import Command
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 load_dotenv()  # Load .env before anything reads env vars
 
@@ -103,12 +103,15 @@ async def classify(task_description: str) -> str:
 
 
 @mcp.tool()
-async def chain(task_description: str, context: str = "", thread_id: str = "") -> str:
+async def chain(task_description: str, ctx: Context, context: str = "", thread_id: str = "") -> str:
     """Auto-route a task through the full LangGraph pipeline with checkpoints.
 
     A dynamic supervisor inspects the state after every node and decides
     what to do next — research, architect, implement, validate, or finish.
     Each node uses CLI tools with native codebase access.
+
+    Streams real-time progress updates as each node completes — you can
+    watch the supervisor's decisions and node results as they happen.
 
     The pipeline will PAUSE for human approval before implementation.
     When paused, use approve(thread_id) to continue or approve(thread_id,
@@ -131,7 +134,21 @@ async def chain(task_description: str, context: str = "", thread_id: str = "") -
         initial_state["context"] = context
 
     graph = _get_graph()
-    result = await graph.ainvoke(initial_state, config=graph_config)
+
+    # Stream updates instead of invoking — get real-time progress
+    result = {}
+    step = 0
+    async for update in graph.astream(
+        initial_state, config=graph_config, stream_mode="updates"
+    ):
+        step += 1
+        # update is {node_name: state_update_dict}
+        for node_name, state_update in update.items():
+            result.update(state_update)
+
+            # Build a progress message from the supervisor's decision
+            message = _build_progress_message(node_name, state_update)
+            await ctx.report_progress(step, message=message)
 
     # Check if graph is paused at a human review interrupt
     state = await graph.aget_state(graph_config)
@@ -156,12 +173,14 @@ async def chain(task_description: str, context: str = "", thread_id: str = "") -
 
 
 @mcp.tool()
-async def approve(thread_id: str, feedback: str = "") -> str:
+async def approve(thread_id: str, ctx: Context, feedback: str = "") -> str:
     """Approve or reject a paused chain that is waiting for human review.
 
     After chain() pauses for human approval, call this to continue.
     Without feedback, the plan is approved and implementation proceeds.
     With feedback, the plan is rejected and the architect revises it.
+
+    Streams real-time progress updates as the pipeline resumes.
 
     Args:
         thread_id: The thread ID from the paused chain() call.
@@ -182,11 +201,19 @@ async def approve(thread_id: str, feedback: str = "") -> str:
     else:
         resume_value = {"decision": "approved", "feedback": ""}
 
-    # Resume the graph — Command(resume=...) provides the value to interrupt()
-    result = await graph.ainvoke(
+    # Resume the graph with streaming — Command(resume=...) provides the value to interrupt()
+    result = {}
+    step = 0
+    async for update in graph.astream(
         Command(resume=resume_value),
         config=graph_config,
-    )
+        stream_mode="updates",
+    ):
+        step += 1
+        for node_name, state_update in update.items():
+            result.update(state_update)
+            message = _build_progress_message(node_name, state_update)
+            await ctx.report_progress(step, message=message)
 
     # Check if it paused again (e.g., architect revised, hit another review)
     state = await graph.aget_state(graph_config)
@@ -322,6 +349,58 @@ async def rewind(thread_id: str, checkpoint_id: str, new_task: str = "") -> str:
         f"**Thread:** `{thread_id}`\n\n"
         f"{formatted}"
     )
+
+
+def _build_progress_message(node_name: str, state_update: dict) -> str:
+    """Build a human-readable progress message from a node's state update.
+
+    Called after each node completes during astream(). Returns a short
+    message suitable for MCP progress notifications.
+    """
+    if node_name == "supervisor":
+        next_node = state_update.get("next_node", "?")
+        rationale = state_update.get("supervisor_rationale", "")
+        parallel = state_update.get("parallel_tasks", [])
+        msg = f"Supervisor → {next_node}"
+        if rationale:
+            msg += f": {rationale}"
+        if parallel:
+            topics = ", ".join(pt.get("topic", "?") for pt in parallel)
+            msg += f" [fan-out: {topics}]"
+        return msg
+
+    if node_name == "validator":
+        score = state_update.get("validation_score")
+        feedback = state_update.get("validation_feedback", "")
+        if score is not None:
+            msg = f"Validator: score {score:.2f}"
+            if feedback:
+                msg += f" — {feedback}"
+            return msg
+        return "Validator: scoring output"
+
+    if node_name == "research":
+        topic = state_update.get("parallel_task_topic", "")
+        if topic:
+            return f"Research completed: {topic}"
+        return "Research completed"
+
+    if node_name == "architect":
+        return "Architect: plan ready"
+
+    if node_name == "implement":
+        return "Implementation completed"
+
+    if node_name == "merge_research":
+        return "Merge: combining parallel research findings"
+
+    if node_name == "human_review":
+        status = state_update.get("human_review_status", "")
+        if status:
+            return f"Human review: {status}"
+        return "Human review: waiting for approval"
+
+    return f"{node_name}: completed"
 
 
 def _format_graph_result(state: dict) -> str:

@@ -61,7 +61,7 @@ graph TD
 
 **Entry point:** `ai-orchestrator-graph` (defined in `pyproject.toml`)
 
-**MCP server:** `src/orchestrator/server.py` — exposes 6 tools over stdio
+**MCP server:** `src/orchestrator/server.py` — exposes 7 tools over stdio
 
 ---
 
@@ -189,7 +189,7 @@ The brain of the pipeline. Uses a cheap/fast API model (Haiku) with **Pydantic s
 **Input:** Full state summary (task, history, node call counts, truncated outputs, validation results)
 
 **Output:** `RouterDecision` — a Pydantic model with:
-- `next_step`: `"research" | "architect" | "implement" | "validator" | "finish"`
+- `next_step`: `"research" | "architect" | "human_review" | "implement" | "validator" | "finish"`
 - `rationale`: One sentence explaining the decision
 - `instructions`: Concrete instructions for the next node
 - `parallel_tasks`: Optional list of `ParallelTask(topic, instructions)` for fan-out research
@@ -283,9 +283,23 @@ The server (`src/orchestrator/server.py`) exposes 7 tools:
 
 1. Generates a `thread_id` (UUID) if not provided
 2. Creates initial state: `{task, context}`
-3. Invokes the compiled graph with checkpointer config
+3. Streams the graph via `astream(stream_mode="updates")` — each node completion sends an MCP progress notification with the supervisor's decision, validation score, or node result
 4. If graph pauses at `human_review` → returns the plan with approval instructions
 5. If graph completes → returns formatted result with supervisor journey, quality scores, and domain outputs
+
+### Streaming Progress
+
+Both `chain()` and `approve()` use `graph.astream()` instead of `graph.ainvoke()`. After each node completes, `_build_progress_message()` formats a short update and `ctx.report_progress()` sends it to the IDE as an MCP progress notification:
+
+| Node | Progress message example |
+|------|------------------------|
+| supervisor | `Supervisor → research: Need to explore caching options [fan-out: redis, memcached]` |
+| validator | `Validator: score 0.85` |
+| research | `Research completed: redis` |
+| architect | `Architect: plan ready` |
+| implement | `Implementation completed` |
+| merge_research | `Merge: combining parallel research findings` |
+| human_review | `Human review: approved` |
 
 ### approve() — Human Review Response
 

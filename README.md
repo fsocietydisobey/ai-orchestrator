@@ -1,215 +1,253 @@
 # AI Orchestrator
 
-LangGraph-powered agent that routes tasks to the right AI model, with full filesystem access for codebase-aware reasoning.
+LangGraph-powered agent that routes tasks to the right AI model, with full codebase access via CLI subprocesses.
 
-| Role | Model | When to use |
-|---|---|---|
-| **Research** | Gemini Pro | Domain exploration, technology investigation, understanding unknowns |
-| **Architect** | Claude Sonnet/Opus | Design decisions, implementation plans, multi-file coordination |
-| **Classify** | Claude Haiku | Fast routing — determines which pipeline a task needs |
-| **Implement** | Codex / IDE model | Clear spec exists, ready to write code |
+| Role | Model | How it runs | When to use |
+|---|---|---|---|
+| **Research** | Gemini Pro | Gemini CLI subprocess | Domain exploration, technology investigation, understanding unknowns |
+| **Architect** | Claude Sonnet | Claude Code CLI subprocess | Design decisions, implementation plans, multi-file coordination |
+| **Implement** | Claude Sonnet | Claude Code CLI subprocess | Clear spec exists, ready to write code |
+| **Supervisor** | Claude Haiku | LangChain API call | Routing decisions — inspects state and picks the next node |
+| **Validator** | Claude Haiku | LangChain API call | Quality scoring — scores output 0.0-1.0 |
 
 ## Architecture
 
-The orchestrator is a **LangGraph StateGraph** exposed via an **MCP server**. Each node in the graph is a different AI model with filesystem tools — so every model can read your codebase, not just the one in your IDE.
+The orchestrator is a **LangGraph StateGraph** with a **hub-and-spoke supervisor pattern**, exposed via an **MCP server**. A central supervisor node inspects the full state after every step and dynamically decides what to do next. Domain nodes shell out to CLI tools (Claude Code, Gemini CLI) for native codebase access.
 
 ```mermaid
 graph TD
     IDE[IDE / Cursor / Claude Code] -->|MCP tool call| Server[MCP Server]
-    Server -->|invoke| Graph[LangGraph StateGraph]
+    Server -->|astream| Graph[LangGraph StateGraph]
 
-    Graph --> Router{Router Node}
-    Router -->|needs research| Research[Research Node<br/>Gemini Pro]
-    Router -->|needs design| Architect[Architect Node<br/>Claude Sonnet/Opus]
-    Router -->|ready to code| Implement[Implement Node<br/>Codex]
+    Graph --> S{Supervisor<br/>Haiku}
 
-    Research -->|findings added to state| Architect
-    Architect -->|spec added to state| Implement
-    Implement -->|result| Server
+    S -->|"next: research"| R[Research<br/>Gemini CLI]
+    S -->|"next: architect"| A[Architect<br/>Claude CLI]
+    S -->|"next: human_review"| H[Human Review<br/>HITL]
+    S -->|"next: implement"| I[Implement<br/>Claude CLI]
+    S -->|"next: validator"| V[Validator<br/>Haiku]
+    S -->|"next: finish"| END_((END))
 
-    subgraph "Filesystem Tools (available to all nodes)"
-        Tools[read_file · glob · grep · list_dir]
-    end
-
-    Research -.->|reads codebase| Tools
-    Architect -.->|reads codebase| Tools
-    Implement -.->|reads & writes code| Tools
+    R --> S
+    A --> S
+    H -->|"approved/rejected"| S
+    I --> S
+    V --> S
 
     style Server fill:#1a1a2e,stroke:#e94560,color:#fff
     style Graph fill:#0d1117,stroke:#58a6ff,color:#fff
-    style Router fill:#161b22,stroke:#8b949e,color:#fff
-    style Research fill:#1a73e8,stroke:#fff,color:#fff
-    style Architect fill:#c45a2c,stroke:#fff,color:#fff
-    style Implement fill:#2d6a4f,stroke:#fff,color:#fff
-    style Tools fill:#21262d,stroke:#8b949e,color:#c9d1d9
+    style S fill:#4a90d9,stroke:#2c5282,color:#fff
+    style R fill:#48bb78,stroke:#276749,color:#fff
+    style A fill:#ed8936,stroke:#9c4221,color:#fff
+    style H fill:#f56565,stroke:#c53030,color:#fff
+    style I fill:#e53e3e,stroke:#9b2c2c,color:#fff
+    style V fill:#9f7aea,stroke:#553c9a,color:#fff
+    style END_ fill:#a0aec0,stroke:#4a5568,color:#fff
 ```
 
-### Why LangGraph?
+v0.5 features: fan-out parallel research via `Send()`, human-in-the-loop approval before implementation, streaming progress updates, output versioning for timeline comparison, checkpoints and time-travel.
 
-The previous version was a simple API router — each model got a prompt string and returned text. The problem: **models had no codebase access**. You had to manually paste file contents into the `context` parameter.
+### Why CLI subprocesses?
 
-With LangGraph, each node is a ReAct agent with filesystem tools. The research model can `grep` for patterns, the architect can `read_file` to understand existing code, and the implement node can read and write files directly. State flows between nodes, so research findings automatically feed into architecture decisions.
+Each domain node shells out to a CLI tool (`claude -p "..."`, Gemini CLI) from the project root. The CLI tools have built-in codebase indexing, search heuristics, and context management — far richer than a ReAct agent discovering files one tool call at a time. The supervisor and validator use cheap API calls (Haiku) for fast routing decisions.
 
 ## How it works
 
 ### State
 
-All nodes share a single `OrchestratorState` that accumulates context as the graph executes:
+All nodes share a single `OrchestratorState` (TypedDict with `total=False`) that accumulates context:
 
 ```python
-from typing import TypedDict, Annotated
-from langgraph.graph import add_messages
-from langchain_core.messages import AnyMessage
-
-class OrchestratorState(TypedDict):
-    """Shared state flowing through the orchestrator graph."""
-    # The original task description from the user
+class OrchestratorState(TypedDict, total=False):
+    # Input
     task: str
-    # Optional user-provided context (file contents, constraints, etc.)
     context: str
-    # Classification result — which pipeline to run
-    classification: dict  # {tier, confidence, reasoning, pipeline}
-    # Accumulated messages from each node's agent execution
-    messages: Annotated[list[AnyMessage], add_messages]
-    # Research findings (populated by research node)
+
+    # Domain outputs — latest (last-writer-wins)
     research_findings: str
-    # Architecture plan (populated by architect node)
     architecture_plan: str
-    # Implementation result (populated by implement node)
     implementation_result: str
+
+    # Output versioning — append reducer (accumulates across attempts/timelines)
+    output_versions: Annotated[list[dict[str, Any]], operator.add]
+
+    # Supervisor routing
+    next_node: str
+    supervisor_rationale: str
+    supervisor_instructions: str
+    history: list[str]           # Step-by-step audit trail
+    node_calls: dict[str, int]   # Call counts per node
+
+    # Fan-out (parallel research)
+    parallel_tasks: list[dict[str, str]]  # Sub-tasks for Send()
+    parallel_task_topic: str              # Topic label per branch
+
+    # Human-in-the-loop
+    human_review_status: str     # "approved" or "rejected"
+    human_feedback: str
+
+    # Validation
+    validation_score: float      # 0.0-1.0 quality score
+    validation_feedback: str
 ```
+
+**Reducer strategy:** `output_versions` uses `operator.add` (append), `messages` uses `add_messages` (accumulate), everything else is last-writer-wins.
 
 ### Nodes
 
-Each node is a factory function that returns an async handler. This pattern (closure over dependencies) keeps nodes testable and configurable:
+Each node is a factory function that returns an async handler. Domain nodes shell out to CLI subprocesses:
 
 ```python
-def make_research_node(model, tools):
-    """Create the research node — Gemini Pro with filesystem tools."""
-    agent = create_react_agent(model, tools, prompt=RESEARCH_SYSTEM_PROMPT)
-
+def build_research_node():
     async def research_node(state: OrchestratorState) -> dict:
-        result = await agent.ainvoke({"messages": [HumanMessage(content=state["task"])]})
-        findings = result["messages"][-1].content
+        task = state.get("task", "")
+        instructions = state.get("supervisor_instructions", "")
+        topic = state.get("parallel_task_topic", "")
+
+        # Parallel sub-task: prepend topic context
+        if topic:
+            instructions = f"[Research sub-task: {topic}]\n\n{instructions}"
+
+        prompt = build_prompt(RESEARCH_SYSTEM_PROMPT, task, ...)
+        findings = await run_gemini(prompt, timeout=600)
+
         return {
             "research_findings": findings,
-            "messages": result["messages"],
+            "output_versions": [{"node": "research", "attempt": N, "topic": label, "content": findings}],
+            "history": history + [f"research: completed (topic: {label})"],
         }
-
     return research_node
 ```
 
-The same pattern applies to the architect and implement nodes — each gets a model and tools, returns a state update dict.
-
-### Routing
-
-A lightweight router function reads the classification and decides which nodes to visit:
+The supervisor uses Pydantic structured output for type-safe routing decisions:
 
 ```python
-def route_after_classify(state: OrchestratorState) -> Literal["research", "architect", "implement"]:
-    """Conditional edge — pick the next node based on classification."""
-    pipeline = state["classification"].get("pipeline", ["architect"])
-    if "research" in pipeline:
-        return "research"
-    elif "architect" in pipeline:
-        return "architect"
-    return "implement"
+class RouterDecision(BaseModel):
+    next_step: Literal["research", "architect", "human_review", "implement", "validator", "finish"]
+    rationale: str
+    instructions: str
+    parallel_tasks: list[ParallelTask] = Field(default_factory=list)
 ```
 
 ### Graph construction
 
 ```python
-from langgraph.graph import StateGraph, START, END
-
 def build_orchestrator_graph(config):
-    """Build the full orchestrator graph."""
-    # Initialize models and tools
-    tools = [read_file, glob_files, grep_content, list_dir]
-
     graph = StateGraph(OrchestratorState)
 
-    # Add nodes
-    graph.add_node("classify", make_classify_node(haiku_model))
-    graph.add_node("research", make_research_node(gemini_model, tools))
-    graph.add_node("architect", make_architect_node(claude_model, tools))
-    graph.add_node("implement", make_implement_node(codex_model, tools))
+    # 7 nodes: supervisor, research, architect, implement, validator, merge_research, human_review
+    graph.add_node("supervisor", supervisor_node)
+    graph.add_node("research", research_node)
+    graph.add_node("architect", architect_node)
+    graph.add_node("implement", implement_node)
+    graph.add_node("validator", validator_node)
+    graph.add_node("merge_research", _merge_research_node)
+    graph.add_node("human_review", human_review_node)
 
-    # Edges
-    graph.add_edge(START, "classify")
-    graph.add_conditional_edges("classify", route_after_classify)
-    graph.add_edge("research", "architect")
-    graph.add_edge("architect", "implement")
-    graph.add_edge("implement", END)
+    # Entry → supervisor (supervisor always makes the first decision)
+    graph.add_edge(START, "supervisor")
 
-    return graph.compile()
+    # Supervisor routes dynamically (may return Send() list for fan-out)
+    graph.add_conditional_edges("supervisor", select_next_node, {
+        "research": "research", "architect": "architect",
+        "human_review": "human_review", "implement": "implement",
+        "validator": "validator", END: END,
+    })
+
+    # Research → merge (fan-out) or supervisor (sequential)
+    graph.add_conditional_edges("research", _research_exit, {
+        "merge_research": "merge_research", "supervisor": "supervisor",
+    })
+
+    # All other nodes return to supervisor
+    graph.add_edge("merge_research", "supervisor")
+    graph.add_edge("human_review", "supervisor")
+    graph.add_edge("architect", "supervisor")
+    graph.add_edge("implement", "supervisor")
+    graph.add_edge("validator", "supervisor")
+
+    return graph.compile(checkpointer=InMemorySaver())
 ```
 
 ### Graph flow
 
 ```mermaid
-stateDiagram-v2
-    [*] --> classify
-    classify --> research: pipeline includes research
-    classify --> architect: pipeline includes architect (no research needed)
-    classify --> implement: ready to code
+sequenceDiagram
+    participant S as Supervisor (Haiku)
+    participant R as Research (Gemini CLI)
+    participant V as Validator (Haiku)
+    participant A as Architect (Claude CLI)
+    participant H as Human Review (HITL)
+    participant I as Implement (Claude CLI)
 
-    research --> architect: findings → state
-    architect --> implement: plan → state
-    implement --> [*]: result → MCP response
+    S->>R: "Explore caching strategies"
+    R-->>S: research_findings
+    S->>V: Validate research
+    V-->>S: score: 0.85
+    S->>A: "Design caching plan"
+    A-->>S: architecture_plan
+    S->>V: Validate plan
+    V-->>S: score: 0.78
+    S->>H: interrupt(plan)
+    Note over H: PAUSED — user reviews
+    H-->>S: approved
+    S->>I: "Implement the caching plan"
+    I-->>S: implementation_result
+    Note over S: finish
 ```
 
-### Filesystem tools
+## MCP tools
 
-Every node gets these tools so it can reason about your actual codebase:
+The server exposes 7 tools — 3 direct (bypass the graph) and 4 graph tools:
 
-| Tool | Description |
-|---|---|
-| `read_file(path)` | Read a file's contents |
-| `glob_files(pattern, directory?)` | Find files matching a glob pattern |
-| `grep_content(pattern, path?, file_type?)` | Search file contents with regex |
-| `list_dir(path)` | List directory contents |
-| `write_file(path, content)` | Write content to a file (implement node only) |
+### Direct tools
 
-Tools are bound to nodes using the closure pattern:
+| Tool | What it does |
+|------|-------------|
+| `research(question, context?)` | Gemini CLI research — bypasses the graph |
+| `architect(goal, context?, constraints?)` | Claude CLI architecture — bypasses the graph |
+| `classify(task_description)` | Fast tier classification via API (Haiku) |
 
-```python
-from langchain_core.tools import tool
+### Graph tools
 
-@tool
-def read_file(path: str) -> str:
-    """Read a file and return its contents."""
-    with open(path) as f:
-        return f.read()
+| Tool | What it does |
+|------|-------------|
+| `chain(task_description, context?, thread_id?)` | Full pipeline with streaming progress — pauses for human approval |
+| `approve(thread_id, feedback?)` | Resume a paused chain — approve or reject with feedback |
+| `history(thread_id, limit?)` | Show checkpoint history — supervisor decisions, scores, state |
+| `rewind(thread_id, checkpoint_id, new_task?)` | Time-travel — rewind to a checkpoint and re-run |
 
-@tool
-def glob_files(pattern: str, directory: str = ".") -> list[str]:
-    """Find files matching a glob pattern."""
-    from pathlib import Path
-    return [str(p) for p in Path(directory).glob(pattern)]
-```
+### chain() with streaming
 
-## MCP integration
-
-The MCP server is the external interface — your IDE calls MCP tools, which internally invoke the LangGraph graph:
+`chain()` uses `graph.astream(stream_mode="updates")` and sends real-time MCP progress notifications after each node completes:
 
 ```python
-from mcp.server.fastmcp import FastMCP
-
-mcp = FastMCP("ai-orchestrator")
-graph = build_orchestrator_graph(config)
-
 @mcp.tool()
-async def chain(task_description: str, context: str = "") -> str:
-    """Auto-route a task through the full pipeline."""
-    result = await graph.ainvoke({
-        "task": task_description,
-        "context": context,
-        "messages": [],
-    })
-    return format_result(result)
+async def chain(task_description: str, ctx: Context, context: str = "", thread_id: str = "") -> str:
+    async for update in graph.astream(initial_state, config=graph_config, stream_mode="updates"):
+        for node_name, state_update in update.items():
+            message = _build_progress_message(node_name, state_update)
+            await ctx.report_progress(step, message=message)
 ```
 
-The individual `research()`, `architect()`, and `classify()` tools still exist for when you want to call a specific model directly.
+| Node | Progress message example |
+|------|------------------------|
+| supervisor | `Supervisor -> research: Need to explore caching options [fan-out: redis, memcached]` |
+| validator | `Validator: score 0.85` |
+| research | `Research completed: redis` |
+| architect | `Architect: plan ready` |
+| implement | `Implementation completed` |
+| human_review | `Human review: approved` |
+
+### Human-in-the-loop
+
+The pipeline **pauses for human approval** before implementation:
+
+1. Supervisor routes to `human_review` after the architecture plan is validated
+2. `human_review` node calls `interrupt(review_payload)` — graph pauses
+3. `chain()` returns the plan with approval instructions and the `thread_id`
+4. User calls `approve(thread_id)` to continue, or `approve(thread_id, feedback="...")` to reject
+5. If rejected, supervisor sends the architect back to revise with your feedback
 
 ## Setup
 
@@ -228,7 +266,6 @@ cp .env.example .env
 # Edit .env with your API keys:
 #   ANTHROPIC_API_KEY=sk-ant-...
 #   GOOGLE_AI_API_KEY=AIza...
-#   OPENAI_API_KEY=sk-...        (for Codex implement node)
 ```
 
 ### 3. Connect to Cursor (Option A — CLI server, recommended)
@@ -297,80 +334,56 @@ Add to `~/.claude.json` under `mcpServers`:
 }
 ```
 
-## Tools
-
-### `research(question, context?)`
-
-Deep research using Gemini with filesystem access. The model can read your codebase to ground its research.
+## Tool examples
 
 ```
+# Direct research (bypasses graph)
 research("How do confidence-gated HITL pipelines work in LangGraph?")
-```
 
-### `architect(goal, context?, constraints?)`
+# Direct architecture (bypasses graph)
+architect("Add WebSocket notifications", constraints="Must work with FastAPI")
 
-Design an implementation plan using Claude. Reads relevant files to understand existing patterns before planning.
-
-```
-architect(
-  "Add real-time WebSocket notifications for task status changes",
-  constraints="Must work with existing FastAPI backend and RTK Query frontend"
-)
-```
-
-### `classify(task_description)`
-
-Fast classification — tells you which tier a task falls into and the recommended pipeline.
-
-```
+# Fast classification
 classify("Fix the typo in the dashboard header")
-# → Tier: implement (confidence: 95%)
-# → Pipeline: implement
+# → Tier: implement (confidence: 95%) — Pipeline: implement
 
-classify("Add vector search to the dashboard AI chat")
-# → Tier: architect (confidence: 88%)
-# → Pipeline: architect → implement
+# Full pipeline — streams progress, pauses for approval
+chain("Add caching to the API routes")
+# → Supervisor → research → validator → architect → validator → human_review (PAUSED)
+# Returns plan + thread_id for approval
 
-classify("How does the fabrication pipeline work end to end?")
-# → Tier: research (confidence: 92%)
-# → Pipeline: research → architect → implement
-```
+# Approve and continue to implementation
+approve(thread_id="abc-123")
 
-### `chain(task_description, context?)`
+# Or reject with feedback
+approve(thread_id="abc-123", feedback="Use Redis instead of Memcached")
 
-Auto-routes through the full LangGraph pipeline. Classifies, researches if needed, architects if needed, implements if needed. Each step has full filesystem access.
+# View checkpoint history
+history(thread_id="abc-123")
 
-```
-chain("Implement a retry mechanism for failed source extractions")
-# 1. Classifies → architect
-# 2. Skips research (domain is understood)
-# 3. Architect reads existing extraction code, designs retry strategy
-# 4. Returns implementation plan with file-specific changes
+# Rewind to a checkpoint and retry with different constraints
+rewind(thread_id="abc-123", checkpoint_id="ckpt-456", new_task="Add caching but keep backward compat")
 ```
 
 ## Configuration
 
-Edit `config.yaml` to change models, providers, or add new roles:
+Edit `config.yaml` to change models, providers, or add new roles. Defaults are baked in if no config file exists:
 
 ```yaml
 roles:
   research:
     provider: google
-    model: gemini-2.0-pro          # swap models here
-    max_tokens: 8192
+    model: gemini-2.0-pro
   architect:
     provider: anthropic
-    model: claude-sonnet-4-20250514  # or claude-opus-4-6
-    max_tokens: 4096
+    model: claude-sonnet-4-20250514
   classify:
     provider: anthropic
     model: claude-haiku-4-5-20251001
     max_tokens: 256
-  implement:
-    provider: openai
-    model: codex-mini               # or gpt-4o
-    max_tokens: 8192
 ```
+
+The **supervisor** and **validator** nodes both use the classify model (Haiku) — cheap and fast for routing decisions and quality scoring. Domain nodes (research, architect, implement) use CLI subprocesses.
 
 ## Project structure
 
@@ -378,35 +391,34 @@ roles:
 ai-orchestrator/
 ├── src/orchestrator/
 │   ├── __init__.py            # Package marker
-│   ├── server.py              # MCP server — exposes tools, chain() invokes graph
-│   ├── router.py              # Routes roles → providers (used by direct tools)
-│   ├── config.py              # Loads config.yaml
+│   ├── server.py              # MCP server — 7 tools, streaming, HITL approve/reject
+│   ├── graph.py               # StateGraph construction — hub-and-spoke + fan-out
+│   ├── state.py               # OrchestratorState TypedDict with reducers
+│   ├── config.py              # YAML config loader with sensible defaults
 │   ├── models.py              # LangChain model factories from config
-│   ├── state.py               # OrchestratorState TypedDict
-│   ├── graph.py               # StateGraph construction and compilation
+│   ├── router.py              # Role → provider resolution (used by direct tools)
 │   ├── nodes/
 │   │   ├── __init__.py        # Exports build_*_node() factories
-│   │   ├── classify.py        # Classifier node (Haiku — fast routing)
-│   │   ├── research.py        # Research node (Gemini — ReAct agent)
-│   │   ├── architect.py       # Architect node (Claude — ReAct agent)
-│   │   ├── implement.py       # Implement node (Claude Code CLI)
-│   │   └── critique.py       # Self-reflection critique nodes (Haiku)
-│   ├── tools/
-│   │   ├── __init__.py        # Exports READ_TOOLS, WRITE_TOOLS
-│   │   └── filesystem.py      # read_file, glob, grep, list_dir, write_file
-│   ├── providers/
-│   │   ├── __init__.py        # Exports Provider classes
-│   │   ├── base.py            # Provider interface (used by direct tools)
-│   │   ├── anthropic_provider.py
-│   │   └── google_provider.py
-│   └── prompts/
-│       ├── __init__.py        # Exports system prompts
-│       ├── research.py        # Gemini system prompt
-│       ├── architect.py       # Claude system prompt
-│       └── classifier.py      # Haiku classifier prompt
-├── config.yaml                # Model and role config
+│   │   ├── supervisor.py      # Central decision-maker (Pydantic structured output)
+│   │   ├── validator.py       # Quality scoring (0.0-1.0) on research/architecture
+│   │   ├── research.py        # Gemini CLI — sequential or parallel via Send()
+│   │   ├── architect.py       # Claude CLI — design/planning with self-correction
+│   │   ├── implement.py       # Claude CLI — code implementation
+│   │   ├── human_review.py    # HITL — pauses graph via interrupt() for approval
+│   │   ├── classify.py        # Classifier node (legacy, used by direct tools)
+│   │   └── critique.py        # Self-reflection critique nodes (legacy)
+│   ├── cli_server_pkg/        # Shared CLI subprocess utilities
+│   │   ├── session/runners.py # run_claude() and run_gemini() wrappers
+│   │   └── helpers/prompts.py # build_prompt() utility
+│   ├── providers/             # API provider classes (used by direct tools)
+│   └── prompts/               # System prompts for research, architect, classifier
+├── docs/
+│   ├── langgraph-architecture.md  # Architecture guide with Mermaid diagrams
+│   ├── langgraph-study-guide.md   # Deep-dive study guide (15 sections)
+│   └── langgraph-patterns.md      # 9 graph patterns reference
+├── config.yaml                # Model and role config (optional — has defaults)
 ├── pyproject.toml             # uv project config
-└── .env.example               # API key template
+└── .env                       # API keys (ANTHROPIC_API_KEY, GOOGLE_AI_API_KEY)
 ```
 
 ## Roadmap
@@ -457,38 +469,18 @@ graph LR
 
 **New MCP tools (Option B)**: `chain(task, context?, thread_id?)`, `history(thread_id)`, `rewind(thread_id, checkpoint_id, new_task?)`
 
-### v0.4 — Dynamic Supervisor
+### v0.4 — Dynamic Supervisor (done)
 
-Replace the linear pipeline with a hub-and-spoke supervisor pattern. Instead of a one-shot classifier routing to a predetermined path, a recurring supervisor inspects the full state after every node and dynamically decides what to do next.
+Hub-and-spoke supervisor pattern replacing the linear pipeline.
 
-| Feature | How it fits | Complexity |
-|---|---|---|
-| **Supervisor node** | Central decision-maker that runs after every node. Inspects full state (history, scores, findings) and picks the next node or terminates. Uses structured output (Pydantic `RouterDecision`). | Medium |
-| **Dynamic routing** | Every node returns to the supervisor. It can skip nodes, reorder them, call the same node twice with different instructions, or terminate early. The flow is fully LLM-driven, not hardcoded. | Medium |
-| **Self-healing** | When a node fails or scores low, the supervisor uses `update_state()` to fork the graph history, inject a hint at a past checkpoint, and re-run from there — automatically, not via manual `rewind()`. | Hard |
-| **Pydantic RouterDecision** | Structured output schema: `next_step` (which node), `rationale` (why), `instructions` (what to tell the node). Type-safe, validated, extensible. | Low |
+- [x] **Supervisor node** — central decision-maker with Pydantic structured output (`RouterDecision`)
+- [x] **Dynamic routing** — every node returns to supervisor, which decides what's next (or terminates)
+- [x] **Validator node** — scores output quality 0.0-1.0, supervisor retries if score is low
+- [x] **Self-healing** — supervisor detects failure and retries with feedback automatically
 
-```mermaid
-graph TD
-    S{Supervisor} -->|needs research| R[Research<br/>Gemini CLI]
-    S -->|needs design| A[Architect<br/>Claude CLI]
-    S -->|ready to code| I[Implement<br/>Claude CLI]
-    S -->|quality check| V[Validator]
-    S -->|done| END_[END]
+### v0.5 — Fan-Out, HITL, Streaming (done)
 
-    R --> S
-    A --> S
-    I --> S
-    V --> S
-
-    style S fill:#e94560,stroke:#fff,color:#fff
-```
-
-The supervisor replaces both `classify` and the critique nodes — it handles routing, quality assessment, and retry logic in one place. Adding new nodes only requires updating the `RouterDecision` literal and the conditional edge map.
-
-### v0.5 — Fan-Out / Fan-In + Human-in-the-Loop (done)
-
-Parallel research via LangGraph's `Send()` API and human approval gate before implementation.
+Parallel research, human approval gate, streaming progress, and output versioning.
 
 **Fan-out / Fan-in:**
 - [x] `RouterDecision` extended with `parallel_tasks: list[ParallelTask]` (topic + instructions)
@@ -506,104 +498,38 @@ Parallel research via LangGraph's `Send()` API and human approval gate before im
 - [x] `chain()` detects interrupt and returns plan with approval instructions
 - [x] Review status shown in `history()` checkpoints and `_format_graph_result()`
 
+**Streaming:**
+- [x] `chain()` and `approve()` use `graph.astream(stream_mode="updates")` for real-time progress
+- [x] `_build_progress_message()` formats per-node progress (supervisor decisions, scores, completions)
+- [x] `ctx.report_progress()` sends MCP progress notifications to the IDE
+
 ### v0.6 — Production features
 
 - [ ] Cost tracking — log token usage per node per request
-- [ ] Streaming — `astream(stream_mode=["messages", "updates"])` for real-time output
 - [ ] Custom roles — define new nodes in `config.yaml` with custom prompts
 - [ ] Streamable HTTP transport — for remote hosting beyond stdio
 - [ ] Rate limiting and circuit breakers per provider
 
 ---
 
-## Future direction: CLI-native orchestration
+## Two execution paths
 
-The current architecture gives models codebase access through custom filesystem tools (read_file, glob, grep). This works, but CLI tools like Claude Code and Gemini CLI provide **much richer codebase context natively** — they have built-in indexing, search heuristics, and context management that a ReAct agent discovering files one tool call at a time can't match.
+Both options are exposed through the same MCP server with different entry points.
 
-Two planned approaches address this, both exposed through the same MCP server:
+### Option A — CLI server (primary workflow, `ai-orchestrator`)
 
-### Option A — Cursor as orchestrator (primary workflow)
+Cursor/Claude Code calls direct tools (`research`, `architect`, `classify`). Each tool delegates to a CLI subprocess. Simple, fast, no graph overhead. Best for ~95% of tasks.
 
-Cursor is the primary IDE and handles implementation for ~95% of tasks. The MCP server gives Cursor access to two additional models for the cases where it needs help:
+### Option B — LangGraph pipeline (experimental, `ai-orchestrator-graph`)
 
-- **Gemini** for research — deep domain exploration, technology investigation, understanding unknowns. Gemini has strong research skills but is weak at writing code.
-- **Claude Code** for complex implementation — multi-file coordination, intricate refactors, tasks where Cursor's built-in models struggle. Claude Code runs headlessly via `claude -p` with full codebase access.
+The full supervisor-driven pipeline with dynamic routing, fan-out, HITL, streaming, checkpoints, and time-travel. Best for complex tasks that benefit from multi-step coordination.
 
-```mermaid
-graph TD
-    You -->|work in| Cursor[Cursor IDE]
-
-    Cursor -->|needs research| MCP[MCP Server]
-    Cursor -->|complex task| MCP
-
-    MCP -->|research| Gemini[Gemini CLI / API<br/>research only]
-    MCP -->|architect + implement| Claude[Claude Code<br/>claude -p]
-
-    Gemini -->|findings| MCP
-    Claude -->|plan or code| MCP
-    MCP -->|result| Cursor
-
-    Cursor -->|simple tasks| Cursor
-
-    style Cursor fill:#1a1a2e,stroke:#e94560,color:#fff
-    style MCP fill:#0d1117,stroke:#58a6ff,color:#fff
-    style Gemini fill:#1a73e8,stroke:#fff,color:#fff
-    style Claude fill:#c45a2c,stroke:#fff,color:#fff
-```
-
-**The workflow**:
-1. You work in Cursor as usual. It handles most tasks directly.
-2. When you need research on a topic/technology, Cursor calls `research()` → Gemini explores and returns findings.
-3. When a task is too complex for Cursor's models, Cursor calls `architect()` or `implement()` → Claude Code takes over with full codebase context, returns a plan or writes code directly.
-
-**Why this split**: Each model does what it's best at. Cursor is fast and handles the majority of day-to-day coding. Gemini is strong at research and exploration but shouldn't be writing code. Claude Code is the heavy hitter for complex architecture and implementation that Cursor can't handle alone.
-
-**What to build**:
-- [ ] Gemini CLI subprocess wrapper — async provider that calls `gemini -p "..."` with `cwd` set to the project root
-- [ ] Claude Code subprocess wrapper — async provider that calls `claude -p "..."` with codebase access
-- [ ] MCP server with `research(question)` → Gemini and `architect(goal)` / `implement(spec)` → Claude Code
-- [ ] Fallback to API providers when CLIs aren't installed
-
-### Option B — LangGraph with CLI subprocesses (experimental)
-
-Keep the full LangGraph pipeline for experimenting with multi-agent coordination, but swap the ReAct agents (API + custom filesystem tools) for CLI subprocess calls. Each model gets native codebase access instead of discovering files one tool call at a time.
-
-```mermaid
-graph TD
-    MCP[MCP Server] -->|chain tool| Graph[LangGraph StateGraph]
-
-    Graph --> Classify{Classify<br/>Haiku API}
-    Classify -->|needs research| Research[Research<br/>gemini -p]
-    Classify -->|needs design| Architect[Architect<br/>claude -p]
-    Classify -->|ready to code| Implement[Implement<br/>claude -p]
-
-    Research -->|findings → state| Architect
-    Architect -->|plan → state| Implement
-    Implement -->|result| MCP
-
-    style MCP fill:#0d1117,stroke:#58a6ff,color:#fff
-    style Classify fill:#161b22,stroke:#8b949e,color:#fff
-    style Research fill:#1a73e8,stroke:#fff,color:#fff
-    style Architect fill:#c45a2c,stroke:#fff,color:#fff
-    style Implement fill:#2d6a4f,stroke:#fff,color:#fff
-```
-
-Each node shells out to a CLI tool (`claude -p "..."`, `gemini -p "..."`) from the project directory so they inherit full codebase context automatically. LangGraph handles routing, state accumulation, and coordination. The custom filesystem tools become unnecessary.
-
-**What to build**:
-- [ ] CLI subprocess provider — async wrapper around `claude -p` and `gemini -p`
-- [ ] Rewire research node to use `gemini -p` subprocess
-- [ ] Rewire architect node to use `claude -p` subprocess
-- [ ] Implement node using `claude -p` with write permissions
-- [ ] Fallback to API providers when CLIs aren't installed
-- [ ] Remove custom filesystem tools once CLI nodes are stable
-
-**Why keep LangGraph**: This is the testbed for advanced agent patterns — self-reflection loops, checkpoints, time-travel, critique nodes. The graph adds value when experimenting with *how agents coordinate*, not just calling individual models.
+Both share the same CLI subprocess wrappers (`run_claude`, `run_gemini`) and system prompts.
 
 ### CLI tool capabilities
 
 | Tool | Headless mode | Codebase-aware | Role in orchestrator |
 |------|--------------|----------------|---------------------|
-| **Cursor** | No (IDE only) | Yes (IDE only) | Orchestrator — handles ~95% of tasks directly, delegates research and complex tasks via MCP |
-| **Claude Code** | `claude -p "..."` | Yes (native) | Complex architecture and implementation — the fallback when Cursor's models aren't enough |
-| **Gemini CLI** | `gemini -p "..."` | Yes (native) | Research only — strong at exploration, weak at writing code |
+| **Cursor** | No (IDE only) | Yes (IDE only) | Primary IDE — delegates research and complex tasks via MCP |
+| **Claude Code** | `claude -p "..."` | Yes (native) | Architecture and implementation (architect, implement nodes) |
+| **Gemini CLI** | `npx @google/gemini-cli` | Yes (native) | Research and exploration (research node) |
