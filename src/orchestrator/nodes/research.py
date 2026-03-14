@@ -18,16 +18,27 @@ def build_research_node():
     """
 
     async def research_node(state: OrchestratorState) -> dict:
-        """Run Gemini CLI research and return findings."""
+        """Run Gemini CLI research and return findings.
+
+        Works in two modes:
+        - Sequential: called normally with full state
+        - Parallel: called via Send() with a partial payload containing
+          task, context, supervisor_instructions, parallel_task_topic
+        """
         task = state.get("task", "")
         context = state.get("context", "")
         instructions = state.get("supervisor_instructions", "")
         feedback = state.get("validation_feedback", "")
+        topic = state.get("parallel_task_topic", "")
         node_calls = dict(state.get("node_calls", {}))
         history = list(state.get("history", []))
 
         # Track call count
         node_calls["research"] = node_calls.get("research", 0) + 1
+
+        # Parallel sub-task: prepend topic context to instructions
+        if topic:
+            instructions = f"[Research sub-task: {topic}]\n\n{instructions}"
 
         prompt = build_prompt(
             RESEARCH_SYSTEM_PROMPT,
@@ -39,10 +50,19 @@ def build_research_node():
 
         findings = await run_gemini(prompt, timeout=600)
 
+        label = topic or "sequential"
         return {
             "research_findings": findings,
+            "output_versions": [
+                {
+                    "node": "research",
+                    "attempt": node_calls["research"],
+                    "topic": label,
+                    "content": findings,
+                }
+            ],
             "node_calls": node_calls,
-            "history": history + [f"research: completed (attempt {node_calls['research']})"],
+            "history": history + [f"research: completed (topic: {label})"],
         }
 
     return research_node

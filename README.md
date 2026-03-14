@@ -486,7 +486,27 @@ graph TD
 
 The supervisor replaces both `classify` and the critique nodes — it handles routing, quality assessment, and retry logic in one place. Adding new nodes only requires updating the `RouterDecision` literal and the conditional edge map.
 
-### v0.5 — Production features
+### v0.5 — Fan-Out / Fan-In + Human-in-the-Loop (done)
+
+Parallel research via LangGraph's `Send()` API and human approval gate before implementation.
+
+**Fan-out / Fan-in:**
+- [x] `RouterDecision` extended with `parallel_tasks: list[ParallelTask]` (topic + instructions)
+- [x] `select_next_node` returns `Send("research", payload)` list when fan-out is requested
+- [x] `merge_research` node combines parallel findings into sectioned markdown
+- [x] `output_versions` append reducer tracks all parallel branch outputs
+- [x] Conditional `_research_exit` edge — fan-out routes to merge, sequential routes to supervisor
+- [x] Backward compatible — empty `parallel_tasks` triggers the existing sequential path
+
+**Human-in-the-loop:**
+- [x] `human_review` node uses `interrupt()` to pause graph before implementation
+- [x] `approve(thread_id, feedback?)` MCP tool resumes with approval or rejection
+- [x] Supervisor routes to `human_review` after architecture plan is validated
+- [x] Rejection sends architect back to revise with human feedback
+- [x] `chain()` detects interrupt and returns plan with approval instructions
+- [x] Review status shown in `history()` checkpoints and `_format_graph_result()`
+
+### v0.6 — Production features
 
 - [ ] Cost tracking — log token usage per node per request
 - [ ] Streaming — `astream(stream_mode=["messages", "updates"])` for real-time output

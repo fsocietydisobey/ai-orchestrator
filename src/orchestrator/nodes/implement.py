@@ -59,6 +59,9 @@ def build_implement_node():
 
         return {
             "implementation_result": result,
+            "output_versions": [
+                {"node": "implement", "attempt": node_calls["implement"], "content": result}
+            ],
             "node_calls": node_calls,
             "history": history + [f"implement: completed (attempt {node_calls['implement']})"],
         }

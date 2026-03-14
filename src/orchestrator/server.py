@@ -2,16 +2,19 @@
 
 Loads .env automatically so API keys don't need to be in MCP config.
 
-v0.3 features:
+v0.5 features:
     - Checkpoints: thread_id support for multi-turn chains
     - Time-travel: history() and rewind() tools
     - Self-reflection: critique nodes score output quality
     - Self-correction: architect validates plans against codebase
+    - Fan-out: parallel research via Send()
+    - HITL: graph pauses for human approval before implementation
 """
 
 import uuid
 
 from dotenv import load_dotenv
+from langgraph.types import Command
 from mcp.server.fastmcp import FastMCP
 
 load_dotenv()  # Load .env before anything reads env vars
@@ -107,6 +110,10 @@ async def chain(task_description: str, context: str = "", thread_id: str = "") -
     what to do next — research, architect, implement, validate, or finish.
     Each node uses CLI tools with native codebase access.
 
+    The pipeline will PAUSE for human approval before implementation.
+    When paused, use approve(thread_id) to continue or approve(thread_id,
+    feedback="...") to reject and send the architect back to revise.
+
     Pass a thread_id to continue a previous chain (multi-turn). Omit for a
     new thread. The thread_id is returned in the response for follow-ups.
 
@@ -126,8 +133,83 @@ async def chain(task_description: str, context: str = "", thread_id: str = "") -
     graph = _get_graph()
     result = await graph.ainvoke(initial_state, config=graph_config)
 
+    # Check if graph is paused at a human review interrupt
+    state = await graph.aget_state(graph_config)
+    if state and state.next and "human_review" in state.next:
+        # Graph is paused — extract the review payload from the interrupt
+        plan = result.get("architecture_plan", "")
+        task = result.get("task", task_description)
+        return (
+            f"**Thread:** `{thread_id}`\n\n"
+            f"## Waiting for Human Approval\n\n"
+            f"The architecture plan is ready for review. "
+            f"The pipeline is **paused** and will not implement until you approve.\n\n"
+            f"### Task\n\n{task}\n\n"
+            f"### Architecture Plan\n\n{plan}\n\n"
+            f"---\n\n"
+            f"**To approve:** `approve(thread_id=\"{thread_id}\")`\n\n"
+            f"**To reject with feedback:** `approve(thread_id=\"{thread_id}\", feedback=\"your feedback here\")`"
+        )
+
     formatted = _format_graph_result(result)
     return f"**Thread:** `{thread_id}`\n\n{formatted}"
+
+
+@mcp.tool()
+async def approve(thread_id: str, feedback: str = "") -> str:
+    """Approve or reject a paused chain that is waiting for human review.
+
+    After chain() pauses for human approval, call this to continue.
+    Without feedback, the plan is approved and implementation proceeds.
+    With feedback, the plan is rejected and the architect revises it.
+
+    Args:
+        thread_id: The thread ID from the paused chain() call.
+        feedback: Optional feedback. If provided, the plan is rejected
+            and the architect will revise based on your feedback.
+    """
+    graph = _get_graph()
+    graph_config = {"configurable": {"thread_id": thread_id}}
+
+    # Check the graph is actually paused
+    state = await graph.aget_state(graph_config)
+    if not state or not state.next or "human_review" not in state.next:
+        return f"Thread `{thread_id}` is not waiting for approval."
+
+    # Build the resume command
+    if feedback:
+        resume_value = {"decision": "rejected", "feedback": feedback}
+    else:
+        resume_value = {"decision": "approved", "feedback": ""}
+
+    # Resume the graph — Command(resume=...) provides the value to interrupt()
+    result = await graph.ainvoke(
+        Command(resume=resume_value),
+        config=graph_config,
+    )
+
+    # Check if it paused again (e.g., architect revised, hit another review)
+    state = await graph.aget_state(graph_config)
+    if state and state.next and "human_review" in state.next:
+        plan = result.get("architecture_plan", "")
+        return (
+            f"**Thread:** `{thread_id}`\n\n"
+            f"## Revised Plan — Waiting for Approval Again\n\n"
+            f"The architect revised the plan based on your feedback. "
+            f"Review and approve/reject again.\n\n"
+            f"### Architecture Plan\n\n{plan}\n\n"
+            f"---\n\n"
+            f"**To approve:** `approve(thread_id=\"{thread_id}\")`\n\n"
+            f"**To reject with feedback:** `approve(thread_id=\"{thread_id}\", feedback=\"...\")`"
+        )
+
+    formatted = _format_graph_result(result)
+    decision = "rejected" if feedback else "approved"
+    return (
+        f"**Thread:** `{thread_id}`\n\n"
+        f"## Review: {decision}\n\n"
+        f"{formatted}"
+    )
 
 
 @mcp.tool()
@@ -174,6 +256,21 @@ async def history(thread_id: str, limit: int = 10) -> str:
         v_score = values.get("validation_score")
         if v_score is not None:
             entry += f"\n- **Validation score:** {v_score:.2f}"
+
+        # Show human review status if present
+        review_status = values.get("human_review_status", "")
+        if review_status:
+            entry += f"\n- **Human review:** {review_status}"
+
+        # Show output version count for timeline comparison
+        versions = values.get("output_versions", [])
+        if versions:
+            version_summary = {}
+            for v in versions:
+                node = v.get("node", "?")
+                version_summary[node] = version_summary.get(node, 0) + 1
+            counts = ", ".join(f"{k}: {v}" for k, v in sorted(version_summary.items()))
+            entry += f"\n- **Output versions:** {counts}"
 
         entries.append(entry)
 
@@ -240,6 +337,15 @@ def _format_graph_result(state: dict) -> str:
         output_parts.append(
             f"## Supervisor Journey\n\n{journey}\n\n**Node calls:** {calls}"
         )
+
+    # Show human review status if present
+    review_status = state.get("human_review_status", "")
+    if review_status:
+        human_feedback = state.get("human_feedback", "")
+        review_line = f"**Human review:** {review_status}"
+        if human_feedback:
+            review_line += f" — {human_feedback}"
+        output_parts.append(f"## Human Review\n\n{review_line}")
 
     # Show validation score if present
     v_score = state.get("validation_score")

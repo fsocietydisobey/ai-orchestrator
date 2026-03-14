@@ -49,6 +49,9 @@ def build_architect_node():
 
         return {
             "architecture_plan": plan,
+            "output_versions": [
+                {"node": "architect", "attempt": node_calls["architect"], "content": plan}
+            ],
             "node_calls": node_calls,
             "history": history + [f"architect: completed (attempt {node_calls['architect']})"],
         }

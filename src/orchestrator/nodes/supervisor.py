@@ -29,8 +29,12 @@ the current state after each step and decide what to do next.
 - **architect**: Design and planning using Claude Code CLI with full codebase
   access. Use when the problem is understood but needs a concrete plan with
   file paths, functions, and step-by-step changes.
+- **human_review**: Pause for human approval. Use BEFORE implement — the human
+  must review and approve the architecture plan before any code is written.
+  ALWAYS route to human_review after the architecture plan is validated.
+  Never skip this step. Never go directly from architect/validator to implement.
 - **implement**: Code implementation using Claude Code CLI with full read/write
-  codebase access. Use when there's a clear plan or spec to execute.
+  codebase access. Use ONLY after human_review has approved the plan.
 - **validator**: Quality check on the most recent output. Use after research
   or architect to verify the output is complete, specific, and actionable.
   Do NOT validate after implement — implementation is the final step.
@@ -41,12 +45,33 @@ the current state after each step and decide what to do next.
 
 1. For unknown domains or exploratory tasks: research first.
 2. For tasks needing design: architect (optionally after research).
-3. For simple/clear tasks: go straight to implement.
+3. For simple/clear tasks: architect first, then human_review, then implement.
 4. After research or architect: validate the output quality.
 5. If the validator reports low quality: retry the node with the feedback.
-6. After implement: finish (do not validate implementation).
-7. Never call the same node more than 3 times total.
-8. If stuck (repeated low scores), finish with what you have.
+6. After architect is validated (good score): ALWAYS route to human_review.
+7. After human_review approved: route to implement.
+8. After human_review rejected: route back to architect with the human's feedback.
+9. After implement: finish (do not validate implementation).
+10. Never call the same node more than 3 times total.
+11. If stuck (repeated low scores), finish with what you have.
+
+## Parallel research (fan-out)
+
+When you choose `research` as next_step, you can optionally fan out into
+multiple parallel sub-tasks. Populate `parallel_tasks` with a list of dicts:
+- `topic`: short label (e.g., "auth-patterns", "caching-strategies")
+- `instructions`: specific instructions for that sub-task
+
+Use parallel research when the task has 2-4 independent knowledge gaps that
+can be explored simultaneously. Do NOT fan out for a single focused question
+— use sequential research with `instructions` instead.
+
+Good candidates for fan-out:
+- Evaluating multiple competing technologies
+- Researching different aspects of a system (API design + data model + auth)
+- Comparing frameworks or libraries
+
+Keep it to 2-4 parallel tasks max. Leave `parallel_tasks` empty for sequential.
 
 ## State inspection
 
@@ -59,13 +84,22 @@ Look at the full state to make your decision:
 - `validation_score`: Last validation score (0.0-1.0, if any)
 - `validation_feedback`: Last validation feedback (if any)
 - `node_calls`: How many times each node has been called
+- `human_review_status`: "approved" or "rejected" (if human review has happened)
+- `human_feedback`: Feedback from the human reviewer (if any)
 """
+
+
+class ParallelTask(BaseModel):
+    """A single sub-task for parallel fan-out research."""
+
+    topic: str = Field(description="Short label for this sub-task (e.g., 'caching-strategies').")
+    instructions: str = Field(description="Specific research instructions for this sub-task.")
 
 
 class RouterDecision(BaseModel):
     """Structured decision from the supervisor."""
 
-    next_step: Literal["research", "architect", "implement", "validator", "finish"] = (
+    next_step: Literal["research", "architect", "human_review", "implement", "validator", "finish"] = (
         Field(description="The next node to execute, or 'finish' to terminate.")
     )
     rationale: str = Field(
@@ -73,6 +107,13 @@ class RouterDecision(BaseModel):
     )
     instructions: str = Field(
         description="Specific instructions for the next node. Be concrete."
+    )
+    parallel_tasks: list[ParallelTask] = Field(
+        default_factory=list,
+        description=(
+            "Optional. If next_step is 'research' and you want PARALLEL research, "
+            "provide 2-4 sub-tasks. Leave empty for sequential research."
+        ),
     )
 
 
@@ -146,6 +187,15 @@ def build_supervisor_node(model: BaseChatModel):
                 f"**Feedback:** {v_feedback}"
             )
 
+        # Show human review status
+        review_status = state.get("human_review_status", "")
+        human_feedback = state.get("human_feedback", "")
+        if review_status:
+            review_section = f"## Human review\n\n**Status:** {review_status}"
+            if human_feedback:
+                review_section += f"\n**Feedback:** {human_feedback}"
+            state_summary_parts.append(review_section)
+
         state_summary = "\n\n".join(state_summary_parts)
 
         messages = [
@@ -155,12 +205,23 @@ def build_supervisor_node(model: BaseChatModel):
 
         decision: RouterDecision = await structured_model.ainvoke(messages)
 
+        # Convert parallel tasks to dicts for state storage
+        parallel_tasks = [
+            {"topic": pt.topic, "instructions": pt.instructions}
+            for pt in decision.parallel_tasks
+        ]
+
+        history_entry = f"supervisor → {decision.next_step}: {decision.rationale}"
+        if parallel_tasks:
+            topics = ", ".join(pt["topic"] for pt in parallel_tasks)
+            history_entry += f" [fan-out: {topics}]"
+
         return {
             "next_node": decision.next_step,
             "supervisor_rationale": decision.rationale,
             "supervisor_instructions": decision.instructions,
-            "history": history
-            + [f"supervisor → {decision.next_step}: {decision.rationale}"],
+            "parallel_tasks": parallel_tasks,
+            "history": history + [history_entry],
         }
 
     return supervisor_node
