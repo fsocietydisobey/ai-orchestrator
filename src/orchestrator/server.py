@@ -5,8 +5,7 @@ Loads .env automatically so API keys don't need to be in MCP config.
 v0.5 features:
     - Checkpoints: thread_id support for multi-turn chains
     - Time-travel: history() and rewind() tools
-    - Self-reflection: critique nodes score output quality
-    - Self-correction: architect validates plans against codebase
+    - Self-correction: validator scores output, supervisor retries with feedback
     - Fan-out: parallel research via Send()
     - HITL: graph pauses for human approval before implementation
 """

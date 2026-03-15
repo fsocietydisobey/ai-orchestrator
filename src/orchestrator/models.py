@@ -72,11 +72,3 @@ def get_classify_model(config: OrchestratorConfig) -> BaseChatModel:
     return _build_model(config, "classify")
 
 
-def get_research_model(config: OrchestratorConfig) -> BaseChatModel:
-    """Get the LangChain chat model configured for research (deep exploration)."""
-    return _build_model(config, "research")
-
-
-def get_architect_model(config: OrchestratorConfig) -> BaseChatModel:
-    """Get the LangChain chat model configured for architecture (design/planning)."""
-    return _build_model(config, "architect")

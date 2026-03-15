@@ -58,14 +58,6 @@ class OrchestratorState(TypedDict, total=False):
         validation_score: 0.0-1.0 quality score from the validator.
         validation_feedback: Actionable feedback if score is low.
 
-    Legacy fields (v0.3 — kept for backward compatibility):
-        classification: Dict from the classify node (tier, confidence, etc.).
-        research_score: Quality score from research critique.
-        research_critique: Feedback from research critique.
-        research_attempts: Number of research attempts.
-        architect_score: Quality score from architect critique.
-        architect_critique: Feedback from architect critique.
-        architect_attempts: Number of architect attempts.
     """
 
     # --- Input ---
@@ -102,11 +94,3 @@ class OrchestratorState(TypedDict, total=False):
     validation_score: float
     validation_feedback: str
 
-    # --- Legacy (v0.3) ---
-    classification: dict[str, Any]
-    research_score: float
-    research_critique: str
-    research_attempts: int
-    architect_score: float
-    architect_critique: str
-    architect_attempts: int

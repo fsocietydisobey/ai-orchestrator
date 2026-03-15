@@ -49,20 +49,6 @@ class Router:
             )
         return self._get_provider(role_config.provider, role_config.model)
 
-    async def route(self, role: str, prompt: str, system_prompt: str = "") -> str:
-        """Route a request to the provider configured for the given role.
-
-        Args:
-            role: The role key (e.g. 'research', 'architect').
-            prompt: The user's message.
-            system_prompt: Override system prompt (uses role default if empty).
-
-        Returns:
-            The model's text response.
-        """
-        provider = self.get_role_provider(role)
-        return await provider.generate(prompt, system_prompt=system_prompt)
-
     async def classify(self, task_description: str) -> dict:
         """Classify a task into a tier using the fast/cheap classifier model.
 
